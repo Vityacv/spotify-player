@@ -1,22 +1,24 @@
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     fmt::Display,
+    time::Instant,
 };
 
 use chrono_humanize::HumanTime;
-use ratatui::text::Line;
+use ratatui::{style::Color, text::Line};
+use ratatui::style::Modifier;
 
 use crate::{state::Episode, utils::format_duration};
 
 use super::{
     config, utils, utils::construct_and_render_block, Album, Artist, ArtistFocusState, Borders,
     BrowsePageUIState, Cell, Constraint, Context, ContextPageUIState, DataReadGuard, Frame, Id,
-    Layout, LibraryFocusState, MutableWindowState, Orientation, PageState, Paragraph,
-    PlaylistFolderItem, Rect, Row, SearchFocusState, SharedState, Style, Table, Track,
+    Layout, LibraryFocusState, List, ListItem, MutableWindowState, Orientation, PageState,
+    Paragraph, PlaylistFolderItem, Rect, Row, SearchFocusState, SharedState, Style, Table, Track,
     UIStateGuard,
 };
 use crate::state::BidiDisplay;
-use crate::state::{LibraryLayout, SearchLayout};
+use crate::state::{BrowseLayout, LibraryLayout, SearchLayout};
 use crate::ui::utils::to_bidi_string;
 
 const COMMAND_TABLE_CONSTRAINTS: [Constraint; 3] = [
@@ -293,10 +295,7 @@ pub fn render_context_page(
 
     // 3+4. Construct and render the page's widgets
     let Some(id) = id_opt else {
-        frame.render_widget(
-            Paragraph::new("Cannot determine the current page's context"),
-            rect,
-        );
+        frame.render_widget(Paragraph::new("Loading context..."), rect);
         return;
     };
 
@@ -537,45 +536,114 @@ pub fn render_browse_page(
     ui: &mut UIStateGuard,
     mut rect: Rect,
 ) {
+    ui.browse_layout = BrowseLayout::default();
     // 1. Get data
     let data = state.data.read();
+    let now = Instant::now();
 
     // 2+3. Construct the page's layout and widgets
-    let (list, len) = match ui.current_page() {
-        PageState::Browse { state: ui_state } => match ui_state {
-            BrowsePageUIState::CategoryList { .. } => {
-                rect =
-                    construct_and_render_block("Categories", &ui.theme, Borders::ALL, frame, rect);
-
-                utils::construct_list_widget(
-                    &ui.theme,
-                    ui.search_filtered_items(&data.browse.categories)
-                        .into_iter()
-                        .map(|c| (c.name.clone(), false))
-                        .collect(),
-                    is_active,
-                )
-            }
-            BrowsePageUIState::CategoryPlaylistList { category, .. } => {
-                let title = format!("{} Playlists", category.name);
-                rect = construct_and_render_block(&title, &ui.theme, Borders::ALL, frame, rect);
-
-                let Some(playlists) = data.browse.category_playlists.get(&category.id) else {
-                    frame.render_widget(Paragraph::new("Loading..."), rect);
-                    return;
-                };
-
-                utils::construct_list_widget(
-                    &ui.theme,
-                    ui.search_filtered_items(playlists)
-                        .into_iter()
-                        .map(|c| (c.name.clone(), false))
-                        .collect(),
-                    is_active,
-                )
-            }
-        },
+    let browse_state_snapshot = match ui.current_page() {
+        PageState::Browse { state } => state.clone(),
         _ => return,
+    };
+
+    let (list, len) = match browse_state_snapshot {
+        BrowsePageUIState::CategoryList { .. } => {
+            rect = construct_and_render_block("Categories", &ui.theme, Borders::ALL, frame, rect);
+
+            ui.browse_layout = BrowseLayout {
+                valid: true,
+                list: rect,
+            };
+
+            let categories = ui.search_filtered_items(&data.browse.categories);
+            let items = categories
+                .iter()
+                .map(|category| {
+                    let mut label = category.name.clone();
+                    let mut style = Style::default();
+
+                    if let Some(until) = data.browse.category_playlists_retry.get(&category.id) {
+                        if *until > now {
+                            let remaining = until.saturating_duration_since(now);
+                            let secs = if remaining.as_secs() > 0 {
+                                remaining.as_secs()
+                            } else if remaining.subsec_millis() > 0 {
+                                1
+                            } else {
+                                0
+                            };
+                            let suffix = if secs > 0 {
+                                format!("retry in {secs}s")
+                            } else {
+                                "retrying soon".to_string()
+                            };
+                            label = format!("{label} ({suffix})");
+                            style = Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM);
+                        }
+                    }
+
+                    ListItem::new(to_bidi_string(&label)).style(style)
+                })
+                .collect::<Vec<_>>();
+
+            (
+                List::new(items).highlight_style(ui.theme.selection(is_active)),
+                categories.len(),
+            )
+        }
+        BrowsePageUIState::CategoryPlaylistList { category, .. } => {
+            let title = format!("{} Playlists", category.name);
+            rect = construct_and_render_block(&title, &ui.theme, Borders::ALL, frame, rect);
+
+            ui.browse_layout = BrowseLayout {
+                valid: true,
+                list: rect,
+            };
+
+            let Some(playlists) = data.browse.category_playlists.get(&category.id) else {
+                let retry_text = data
+                    .browse
+                    .category_playlists_retry
+                    .get(&category.id)
+                    .and_then(|until| {
+                        if *until > now {
+                            let remaining = until.saturating_duration_since(now);
+                            let secs = if remaining.as_secs() > 0 {
+                                remaining.as_secs()
+                            } else if remaining.subsec_millis() > 0 {
+                                1
+                            } else {
+                                0
+                            };
+                            Some(if secs > 0 {
+                                format!("Temporarily rate limited. Retry in {secs}s...")
+                            } else {
+                                "Temporarily rate limited. Retrying shortly...".to_string()
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                let message = retry_text.unwrap_or_else(|| "Loading...".to_string());
+                frame.render_widget(Paragraph::new(message), rect);
+                return;
+            };
+
+            let items = ui
+                .search_filtered_items(playlists)
+                .into_iter()
+                .map(|playlist| ListItem::new(to_bidi_string(&playlist.name)))
+                .collect::<Vec<_>>();
+
+            let len = items.len();
+            (
+                List::new(items).highlight_style(ui.theme.selection(is_active)),
+                len,
+            )
+        }
     };
 
     // 4. Render the page's widget

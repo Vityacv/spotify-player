@@ -495,7 +495,7 @@ fn handle_action_for_browse_page(
     }
 }
 
-fn handle_command_for_browse_page(
+pub(super) fn handle_command_for_browse_page(
     command: Command,
     client_pub: &flume::Sender<ClientRequest>,
     ui: &mut UIStateGuard,
@@ -533,12 +533,26 @@ fn handle_command_for_browse_page(
             PageState::Browse { state } => match state {
                 BrowsePageUIState::CategoryList { .. } => {
                     let categories = ui.search_filtered_items(&data.browse.categories);
+                    let selected_category = categories[selected];
+                    if let Some(retry_until) = data
+                        .browse
+                        .category_playlists_retry
+                        .get(&selected_category.id)
+                    {
+                        if *retry_until > std::time::Instant::now() {
+                            tracing::info!(
+                                "Skip fetching playlists for category {} due to rate limiting",
+                                selected_category.name
+                            );
+                            return Ok(true);
+                        }
+                    }
                     client_pub.send(ClientRequest::GetBrowseCategoryPlaylists(
-                        categories[selected].clone(),
+                        selected_category.clone(),
                     ))?;
                     ui.new_page(PageState::Browse {
                         state: BrowsePageUIState::CategoryPlaylistList {
-                            category: categories[selected].clone(),
+                            category: selected_category.clone(),
                             state: ListState::default(),
                         },
                     });

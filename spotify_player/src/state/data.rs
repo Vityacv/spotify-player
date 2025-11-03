@@ -1,5 +1,5 @@
 use std::io::{BufReader, BufWriter};
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, time::Instant};
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::LazyLock;
@@ -67,6 +67,7 @@ pub struct MemoryCaches {
 pub struct BrowseData {
     pub categories: Vec<Category>,
     pub category_playlists: HashMap<String, Vec<Playlist>>,
+    pub category_playlists_retry: HashMap<String, Instant>,
 }
 
 impl MemoryCaches {

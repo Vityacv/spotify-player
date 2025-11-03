@@ -1,5 +1,14 @@
 # spotify_player
 
+> Fork additions
+>
+> - Mouse support for Search, Library, Browse pages (click + double-click) and track tables.
+> - Mouse wheel paging on lists/tables (Search, Library, Browse, Context).
+> - Search pagination with automatic fetch of additional results as you scroll.
+> - Keyboard shortcuts: `F1` library, `F2` search, `F3` browse.
+> - OAuth helper scripts & local tools for token acquisition / library export (see `scripts/` and `OAUTH.md`).
+> - Browse categories show Spotify rate-limit countdowns, automatically retry when windows expire, and gracefully skip/inspect unusual playlist payloads returned by the API (logs include truncated JSON).
+
 ## Table of Contents
 
 - [Introduction](#introduction)

@@ -174,6 +174,7 @@ fn handle_mouse_event(
                 .map(|(ts, _, row)| ts.elapsed() <= Duration::from_millis(500) && row == event.row)
                 .unwrap_or(false);
             ui.last_mouse_click = Some((now, event.column, event.row));
+            ui.last_mouse_position = Some((event.column, event.row));
 
             if let PageState::Search { .. } = ui.current_page() {
                 let layout = ui.search_layout;
@@ -464,7 +465,7 @@ fn handle_mouse_event(
                                 return;
                             }
 
-                            let relative = event.row.saturating_sub(rect.y) as usize;
+                        let relative = event.row.saturating_sub(rect.y) as usize;
                             let height = rect.height as usize;
                             if relative >= height {
                                 return;
@@ -544,6 +545,136 @@ fn handle_mouse_event(
                         return Ok(());
                     }
                     drop(data);
+                }
+            }
+
+            if let PageState::Browse { .. } = ui.current_page() {
+                let layout = ui.browse_layout;
+                if layout.valid {
+                    let rect = layout.list;
+                    if event.column >= rect.x
+                        && event.column < rect.x.saturating_add(rect.width)
+                        && event.row >= rect.y
+                        && event.row < rect.y.saturating_add(rect.height)
+                    {
+                        #[derive(Clone, Copy)]
+                        enum BrowseSelection {
+                            Categories { index: usize, offset: usize },
+                            CategoryPlaylists { index: usize, offset: usize },
+                        }
+
+                        let selection = {
+                            let data = state.data.read();
+                            let height = rect.height as usize;
+                            if height == 0 {
+                                None
+                            } else {
+                                let relative = event.row.saturating_sub(rect.y) as usize;
+                                if relative >= height {
+                                    None
+                                } else {
+                                    match ui.current_page() {
+                                        PageState::Browse {
+                                            state:
+                                                BrowsePageUIState::CategoryList { state: list },
+                                        } => {
+                                            let len =
+                                                ui.search_filtered_items(&data.browse.categories)
+                                                    .len();
+                                            if len == 0 {
+                                                None
+                                            } else {
+                                                let mut index =
+                                                    list.offset().saturating_add(relative);
+                                                if index >= len {
+                                                    index = len - 1;
+                                                }
+                                                let mut new_offset = list.offset();
+                                                if index < new_offset {
+                                                    new_offset = index;
+                                                } else if index >= new_offset + height {
+                                                    new_offset = index + 1 - height;
+                                                }
+                                                Some(BrowseSelection::Categories {
+                                                    index,
+                                                    offset: new_offset,
+                                                })
+                                            }
+                                        }
+                                        PageState::Browse {
+                                            state:
+                                                BrowsePageUIState::CategoryPlaylistList {
+                                                    category,
+                                                    state: list,
+                                                },
+                                        } => {
+                                            if let Some(playlists) =
+                                                data.browse.category_playlists.get(&category.id)
+                                            {
+                                                let len =
+                                                    ui.search_filtered_items(playlists).len();
+                                                if len == 0 {
+                                                    None
+                                                } else {
+                                                    let mut index =
+                                                        list.offset().saturating_add(relative);
+                                                    if index >= len {
+                                                        index = len - 1;
+                                                    }
+                                                    let mut new_offset = list.offset();
+                                                    if index < new_offset {
+                                                        new_offset = index;
+                                                    } else if index >= new_offset + height {
+                                                        new_offset = index + 1 - height;
+                                                    }
+                                                    Some(BrowseSelection::CategoryPlaylists {
+                                                        index,
+                                                        offset: new_offset,
+                                                    })
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                            }
+                        };
+
+                        if let Some(selection) = selection {
+                            if let PageState::Browse { state } = ui.current_page_mut() {
+                                match (state, selection) {
+                                    (
+                                        BrowsePageUIState::CategoryList { state },
+                                        BrowseSelection::Categories { index, offset },
+                                    ) => {
+                                        state.select(Some(index));
+                                        *state.offset_mut() = offset;
+                                    }
+                                    (
+                                        BrowsePageUIState::CategoryPlaylistList { state, .. },
+                                        BrowseSelection::CategoryPlaylists { index, offset },
+                                    ) => {
+                                        state.select(Some(index));
+                                        *state.offset_mut() = offset;
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            ui.count_prefix = None;
+                            if is_double_click {
+                                page::handle_command_for_browse_page(
+                                    Command::ChooseSelected,
+                                    client_pub,
+                                    &mut ui,
+                                    state,
+                                )?;
+                            }
+                            return Ok(());
+                        }
+                    }
                 }
             }
 
@@ -694,18 +825,24 @@ fn handle_mouse_event(
 
             Ok(())
         }
+        MouseEventKind::Moved => {
+            state.ui.lock().last_mouse_position = Some((event.column, event.row));
+            Ok(())
+        }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
             let mut ui = state.ui.lock();
+            let (pointer_col, pointer_row) =
+                ui.last_mouse_position.unwrap_or((event.column, event.row));
             let command = if matches!(event.kind, MouseEventKind::ScrollDown) {
                 Command::PageSelectNextOrScrollDown
             } else {
                 Command::PageSelectPreviousOrScrollUp
             };
             let within = |rect: ratatui::layout::Rect| -> bool {
-                event.column >= rect.x
-                    && event.column < rect.x.saturating_add(rect.width)
-                    && event.row >= rect.y
-                    && event.row < rect.y.saturating_add(rect.height)
+                pointer_col >= rect.x
+                    && pointer_col < rect.x.saturating_add(rect.width)
+                    && pointer_row >= rect.y
+                    && pointer_row < rect.y.saturating_add(rect.height)
             };
 
             if let Some(track_rect) = ui.context_track_table_rect {
@@ -954,6 +1091,16 @@ fn handle_mouse_event(
                             ui.count_prefix = None;
                             return Ok(());
                         }
+                    }
+                }
+            }
+
+            if let PageState::Browse { .. } = ui.current_page() {
+                let layout = ui.browse_layout;
+                if layout.valid && within(layout.list) {
+                    if page::handle_command_for_browse_page(command, client_pub, &mut ui, state)? {
+                        ui.count_prefix = None;
+                        return Ok(());
                     }
                 }
             }

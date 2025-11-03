@@ -1,5 +1,10 @@
 use std::ops::Deref;
-use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::{hash_map::Entry, HashMap},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::state::Lyrics;
 use crate::{auth, config};
@@ -23,8 +28,8 @@ use anyhow::Result;
 #[cfg(feature = "streaming")]
 use parking_lot::Mutex;
 
-use reqwest::StatusCode;
-use rspotify::{http::Query, prelude::*};
+use reqwest::{header, StatusCode};
+use rspotify::{http::Query, prelude::*, http::HttpError};
 
 mod handlers;
 mod request;
@@ -63,7 +68,282 @@ fn market_query() -> Query<'static> {
     Query::from([("market", "from_token")])
 }
 
+fn retry_after_from_client_error(err: &rspotify::ClientError) -> Option<Duration> {
+    if let rspotify::ClientError::Http(http_err) = err {
+        if let rspotify::http::HttpError::StatusCode(response) = http_err.as_ref() {
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                if let Some(retry_after) = response.headers().get(header::RETRY_AFTER) {
+                    if let Ok(value) = retry_after.to_str() {
+                        if let Ok(seconds) = value.trim().parse::<u64>() {
+                            return Some(Duration::from_secs(seconds));
+                        }
+                    }
+                }
+                return Some(Duration::from_secs(5));
+            }
+        }
+    }
+    None
+}
+
 impl AppClient {
+    fn schedule_browse_category_retry(
+        &self,
+        state: &SharedState,
+        category: Category,
+        retry_after: Duration,
+    ) {
+        let until = Instant::now()
+            .checked_add(retry_after)
+            .unwrap_or_else(Instant::now);
+        let category_id = category.id.clone();
+        tracing::warn!(
+            "Rate limited when fetching playlists for category {category_id}, retrying after {:?}",
+            retry_after
+        );
+
+        let mut data = state.data.write();
+        let entry = data
+            .browse
+            .category_playlists_retry
+            .entry(category_id.clone());
+        let should_schedule_retry = match entry {
+            Entry::Occupied(mut occupied) => {
+                if *occupied.get() < until {
+                    occupied.insert(until);
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(until);
+                true
+            }
+        };
+        drop(data);
+
+        if !should_schedule_retry {
+            return;
+        }
+
+        let client_clone = self.clone();
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(retry_after).await;
+            let category_id = category.id.clone();
+
+            {
+                let data = state_clone.data.read();
+                match data.browse.category_playlists_retry.get(&category_id) {
+                    Some(stored_until) if *stored_until <= Instant::now() => {}
+                    _ => return,
+                }
+            }
+
+            match client_clone.browse_category_playlists(&category_id).await {
+                Ok(playlists) => {
+                    let mut data = state_clone.data.write();
+                    data.browse
+                        .category_playlists
+                        .insert(category_id.clone(), playlists);
+                    data.browse.category_playlists_retry.remove(&category_id);
+                }
+                Err(err) => {
+                    if let Some(next_retry) = err
+                        .downcast_ref::<rspotify::ClientError>()
+                        .and_then(retry_after_from_client_error)
+                    {
+                        tracing::warn!(
+                            "Rate limited again when retrying category {category_id}, retry after {:?}",
+                            next_retry
+                        );
+                        client_clone.schedule_browse_category_retry(
+                            &state_clone,
+                            category.clone(),
+                            next_retry,
+                        );
+                    } else {
+                        {
+                            let mut data = state_clone.data.write();
+                            data.browse.category_playlists_retry.remove(&category_id);
+                        }
+                        tracing::error!(
+                            "Failed to retry fetching playlists for category {}: {err:#}",
+                            category_id
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    async fn browse_category_playlists_fallback(
+        &self,
+        category_id: &str,
+    ) -> Result<Vec<Playlist>> {
+        #[derive(Debug, Default, Deserialize)]
+        struct FallbackOwner {
+            #[serde(default)]
+            display_name: Option<String>,
+            #[serde(default)]
+            id: Option<String>,
+        }
+
+        #[derive(Debug, Default, Deserialize)]
+        struct FallbackPlaylist {
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            collaborative: Option<bool>,
+            #[serde(default)]
+            owner: FallbackOwner,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            snapshot_id: Option<String>,
+        }
+
+        #[derive(Debug, Default, Deserialize)]
+        struct FallbackPlaylistItems {
+            #[serde(default)]
+            items: Vec<FallbackPlaylist>,
+        }
+
+        #[derive(Debug, Default, Deserialize)]
+        struct FallbackCategoryResponse {
+            #[serde(default)]
+            playlists: FallbackPlaylistItems,
+        }
+
+        fn truncate_for_log(input: &str, max_len: usize) -> String {
+            if input.len() <= max_len {
+                input.to_string()
+            } else {
+                let mut end = max_len;
+                while !input.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &input[..end])
+            }
+        }
+
+        let token = self.spotify.access_token().await?;
+        let url = format!(
+            "{SPOTIFY_API_ENDPOINT}/browse/categories/{category_id}/playlists"
+        );
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(token)
+            .query(&[("limit", "50")])
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            tracing::warn!(
+                "Fallback request for category {} returned HTTP status {}",
+                category_id,
+                status
+            );
+            return Err(rspotify::ClientError::Http(Box::new(HttpError::StatusCode(
+                response,
+            )))
+            .into());
+        }
+
+        let text = response.text().await?;
+        let payload: FallbackCategoryResponse = match serde_json::from_str(&text) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::error!(
+                    "Failed to parse fallback playlist payload for category {}: {err}. Raw response: {}",
+                    category_id,
+                    truncate_for_log(&text, 2048)
+                );
+                return Err(err.into());
+            }
+        };
+
+        let mut playlists = Vec::new();
+        for item in payload.playlists.items {
+            let id_str = match item.id.as_deref() {
+                Some(id) if !id.is_empty() => id,
+                _ => {
+                    tracing::warn!(
+                        "Skipping playlist without ID in category {} (name={})",
+                        category_id,
+                        item.name.as_deref().unwrap_or("<unknown>")
+                    );
+                    continue;
+                }
+            };
+
+            let playlist_id = match PlaylistId::from_id_or_uri(id_str) {
+                Ok(id) => id.into_static(),
+                Err(err) => {
+                    tracing::warn!(
+                        "Skipping playlist with invalid ID '{}' in category {}: {err}",
+                        id_str,
+                        category_id
+                    );
+                    continue;
+                }
+            };
+
+            let name = match item.name {
+                Some(name) if !name.is_empty() => name,
+                _ => {
+                    tracing::warn!(
+                        "Skipping playlist without name in category {}",
+                        category_id
+                    );
+                    continue;
+                }
+            };
+
+            let owner_id_str = match item.owner.id.as_deref() {
+                Some(id) if !id.is_empty() => id,
+                _ => {
+                    tracing::warn!(
+                        "Skipping playlist '{}' due to missing owner ID",
+                        name
+                    );
+                    continue;
+                }
+            };
+
+            let owner_id = match UserId::from_id_or_uri(owner_id_str) {
+                Ok(id) => id.into_static(),
+                Err(err) => {
+                    tracing::warn!(
+                        "Skipping playlist '{}' due to invalid owner ID '{}': {err}",
+                        name,
+                        owner_id_str
+                    );
+                    continue;
+                }
+            };
+
+            let snapshot_id = item.snapshot_id.unwrap_or_default();
+
+            playlists.push(Playlist {
+                id: playlist_id,
+                collaborative: item.collaborative.unwrap_or(false),
+                name,
+                owner: (item.owner.display_name.unwrap_or_default(), owner_id),
+                desc: item.description.unwrap_or_default(),
+                current_folder_id: 0,
+                snapshot_id,
+            });
+        }
+
+        Ok(playlists)
+    }
+
     /// Construct a new client
     pub async fn new() -> Result<Self> {
         let configs = config::get_config();
@@ -354,13 +634,27 @@ impl AppClient {
                 state.data.write().browse.categories = categories;
             }
             ClientRequest::GetBrowseCategoryPlaylists(category) => {
-                let playlists = self.browse_category_playlists(&category.id).await?;
-                state
-                    .data
-                    .write()
-                    .browse
-                    .category_playlists
-                    .insert(category.id, playlists);
+                let category_id = category.id.clone();
+                let retry_category = category.clone();
+                match self.browse_category_playlists(&category_id).await {
+                    Ok(playlists) => {
+                        let mut data = state.data.write();
+                        data.browse
+                            .category_playlists
+                            .insert(category_id.clone(), playlists);
+                        data.browse.category_playlists_retry.remove(&category_id);
+                    }
+                    Err(err) => {
+                        if let Some(retry_after) = err
+                            .downcast_ref::<rspotify::ClientError>()
+                            .and_then(retry_after_from_client_error)
+                        {
+                            self.schedule_browse_category_retry(state, retry_category, retry_after);
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                }
             }
             ClientRequest::GetLyrics { track_id } => {
                 let uri = track_id.uri();
@@ -749,11 +1043,25 @@ impl AppClient {
 
     /// Get Spotify's available browse playlists of a given category
     pub async fn browse_category_playlists(&self, category_id: &str) -> Result<Vec<Playlist>> {
-        let first_page = self
+        match self
             .category_playlists_manual(category_id, None, Some(50), None)
-            .await?;
-
-        Ok(first_page.items.into_iter().map(Playlist::from).collect())
+            .await
+        {
+            Ok(first_page) => Ok(first_page.items.into_iter().map(Playlist::from).collect()),
+            Err(err) => {
+                if let rspotify::ClientError::ParseJson(parse_err) = &err {
+                    tracing::warn!(
+                        "Falling back to tolerant playlist parser for category {} due to parse error: {parse_err}",
+                        category_id
+                    );
+                    return self
+                        .browse_category_playlists_fallback(category_id)
+                        .await
+                        .context("fallback fetching category playlists");
+                }
+                Err(err.into())
+            }
+        }
     }
 
     /// Find an available device. If found, return the device's ID.

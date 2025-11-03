@@ -32,6 +32,7 @@ pub struct UIState {
     pub input_key_sequence: key::KeySequence,
     pub orientation: ui::Orientation,
     pub last_mouse_click: Option<(std::time::Instant, u16, u16)>,
+    pub last_mouse_position: Option<(u16, u16)>,
     pub pending_client_requests: Vec<PendingClientRequest>,
 
     pub history: Vec<PageState>,
@@ -42,6 +43,7 @@ pub struct UIState {
     pub playback_progress_bar_rect: ratatui::layout::Rect,
     pub search_layout: SearchLayout,
     pub library_layout: LibraryLayout,
+    pub browse_layout: BrowseLayout,
     pub context_track_table_rect: Option<ratatui::layout::Rect>,
 
     /// Count prefix for vim-style navigation (e.g., 5j, 10k)
@@ -118,6 +120,7 @@ impl Default for UIState {
                 }
             },
             last_mouse_click: None,
+            last_mouse_position: None,
 
             history: vec![PageState::Library {
                 state: LibraryPageUIState::new(),
@@ -128,6 +131,7 @@ impl Default for UIState {
             playback_progress_bar_rect: Rect::default(),
             search_layout: SearchLayout::default(),
             library_layout: LibraryLayout::default(),
+            browse_layout: BrowseLayout::default(),
             context_track_table_rect: None,
 
             count_prefix: None,
@@ -173,6 +177,12 @@ pub struct LibraryLayout {
     pub artists: Rect,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BrowseLayout {
+    pub valid: bool,
+    pub list: Rect,
+}
+
 #[derive(Debug)]
 pub enum PendingClientRequest {
     SearchMore {
@@ -188,6 +198,15 @@ impl Default for LibraryLayout {
             playlists: Rect::default(),
             albums: Rect::default(),
             artists: Rect::default(),
+        }
+    }
+}
+
+impl Default for BrowseLayout {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            list: Rect::default(),
         }
     }
 }
