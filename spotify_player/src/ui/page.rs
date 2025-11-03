@@ -16,6 +16,7 @@ use super::{
     UIStateGuard,
 };
 use crate::state::BidiDisplay;
+use crate::state::{LibraryLayout, SearchLayout};
 use crate::ui::utils::to_bidi_string;
 
 const COMMAND_TABLE_CONSTRAINTS: [Constraint; 3] = [
@@ -53,11 +54,11 @@ pub fn render_search_page(
             state,
             current_query,
             line_input,
-        } => (state.focus, current_query, line_input),
+        } => (state.focus, current_query.clone(), line_input.clone()),
         _ => return,
     };
 
-    let search_results = data.caches.search.get(current_query);
+    let search_results = data.caches.search.get(&current_query);
 
     // 2. Construct the page's layout
     let rect = construct_and_render_block("Search", &ui.theme, Borders::ALL, frame, rect);
@@ -133,10 +134,21 @@ pub fn render_search_page(
     let episode_rect =
         construct_and_render_block("Episodes", &ui.theme, Borders::TOP, frame, chunks[5]);
 
+    ui.search_layout = SearchLayout {
+        valid: true,
+        input: search_input_rect,
+        tracks: track_rect,
+        albums: album_rect,
+        artists: artist_rect,
+        playlists: playlist_rect,
+        shows: show_rect,
+        episodes: episode_rect,
+    };
+
     // 3. Construct the page's widgets
     let (track_list, n_tracks) = {
         let track_items = search_results
-            .map(|s| search_items(&s.tracks))
+            .map(|s| search_items(&s.results.tracks))
             .unwrap_or_default();
 
         let is_active = is_active && focus_state == SearchFocusState::Tracks;
@@ -146,7 +158,7 @@ pub fn render_search_page(
 
     let (album_list, n_albums) = {
         let album_items = search_results
-            .map(|s| search_items(&s.albums))
+            .map(|s| search_items(&s.results.albums))
             .unwrap_or_default();
 
         let is_active = is_active && focus_state == SearchFocusState::Albums;
@@ -156,7 +168,7 @@ pub fn render_search_page(
 
     let (artist_list, n_artists) = {
         let artist_items = search_results
-            .map(|s| search_items(&s.artists))
+            .map(|s| search_items(&s.results.artists))
             .unwrap_or_default();
 
         let is_active = is_active && focus_state == SearchFocusState::Artists;
@@ -166,7 +178,7 @@ pub fn render_search_page(
 
     let (playlist_list, n_playlists) = {
         let playlist_items = search_results
-            .map(|s| search_items(&s.playlists))
+            .map(|s| search_items(&s.results.playlists))
             .unwrap_or_default();
 
         let is_active = is_active && focus_state == SearchFocusState::Playlists;
@@ -176,7 +188,7 @@ pub fn render_search_page(
 
     let (show_list, n_shows) = {
         let show_items = search_results
-            .map(|s| search_items(&s.shows))
+            .map(|s| search_items(&s.results.shows))
             .unwrap_or_default();
         let is_active = is_active && focus_state == SearchFocusState::Shows;
 
@@ -185,7 +197,7 @@ pub fn render_search_page(
 
     let (episode_list, n_episodes) = {
         let episode_items = search_results
-            .map(|s| search_items(&s.episodes))
+            .map(|s| search_items(&s.results.episodes))
             .unwrap_or_default();
 
         let is_active = is_active && focus_state == SearchFocusState::Episodes;
@@ -260,13 +272,13 @@ pub fn render_context_page(
     rect: Rect,
 ) {
     // 1. Get data
-    let PageState::Context {
-        id,
-        context_page_type,
-        ..
-    } = ui.current_page()
-    else {
-        return;
+    let (id_opt, context_page_type) = match ui.current_page() {
+        PageState::Context {
+            id,
+            context_page_type,
+            ..
+        } => (id.clone(), context_page_type.clone()),
+        _ => return,
     };
 
     // 2. Construct the page's layout
@@ -277,9 +289,10 @@ pub fn render_context_page(
         frame,
         rect,
     );
+    ui.context_track_table_rect = None;
 
     // 3+4. Construct and render the page's widgets
-    let Some(id) = id else {
+    let Some(id) = id_opt else {
         frame.render_widget(
             Paragraph::new("Cannot determine the current page's context"),
             rect,
@@ -440,6 +453,13 @@ pub fn render_library_page(
     );
     let artist_rect =
         construct_and_render_block("Artists", &ui.theme, Borders::ALL, frame, chunks[2]);
+
+    ui.library_layout = LibraryLayout {
+        valid: true,
+        playlists: playlist_rect,
+        albums: album_rect,
+        artists: artist_rect,
+    };
 
     // 3. Construct the page's widgets
     // Construct the playlist window
@@ -945,6 +965,7 @@ fn render_track_table(
     ui: &mut UIStateGuard,
     data: &DataReadGuard,
 ) {
+    ui.context_track_table_rect = Some(rect);
     let configs = config::get_config();
     // get the current playing track's URI to decorate such track (if exists) in the track table
     let mut playing_track_uri = String::new();

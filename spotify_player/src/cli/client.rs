@@ -27,6 +27,8 @@ use super::{
     Response, Serialize, MAX_REQUEST_SIZE,
 };
 
+const CLI_SEARCH_LIMIT: u32 = 50;
+
 pub async fn start_socket(client: AppClient, socket: UdpSocket, state: Option<SharedState>) {
     let mut buf = [0; MAX_REQUEST_SIZE];
 
@@ -228,7 +230,12 @@ async fn get_spotify_id(client: &AppClient, typ: ItemType, id_or_name: IdOrName)
             IdOrName::Id(id) => ItemId::Playlist(PlaylistId::from_id(id)?),
             IdOrName::Name(name) => {
                 let results = client
-                    .search_specific_type(&name, rspotify::model::SearchType::Playlist)
+                    .search_specific_type(
+                        &name,
+                        rspotify::model::SearchType::Playlist,
+                        CLI_SEARCH_LIMIT,
+                        0,
+                    )
                     .await?;
 
                 match results {
@@ -246,7 +253,12 @@ async fn get_spotify_id(client: &AppClient, typ: ItemType, id_or_name: IdOrName)
             IdOrName::Id(id) => ItemId::Album(AlbumId::from_id(id)?),
             IdOrName::Name(name) => {
                 let results = client
-                    .search_specific_type(&name, rspotify::model::SearchType::Album)
+                    .search_specific_type(
+                        &name,
+                        rspotify::model::SearchType::Album,
+                        CLI_SEARCH_LIMIT,
+                        0,
+                    )
                     .await?;
 
                 match results {
@@ -265,7 +277,12 @@ async fn get_spotify_id(client: &AppClient, typ: ItemType, id_or_name: IdOrName)
             IdOrName::Id(id) => ItemId::Artist(ArtistId::from_id(id)?),
             IdOrName::Name(name) => {
                 let results = client
-                    .search_specific_type(&name, rspotify::model::SearchType::Artist)
+                    .search_specific_type(
+                        &name,
+                        rspotify::model::SearchType::Artist,
+                        CLI_SEARCH_LIMIT,
+                        0,
+                    )
                     .await?;
 
                 match results {
@@ -283,7 +300,12 @@ async fn get_spotify_id(client: &AppClient, typ: ItemType, id_or_name: IdOrName)
             IdOrName::Id(id) => ItemId::Track(TrackId::from_id(id)?),
             IdOrName::Name(name) => {
                 let results = client
-                    .search_specific_type(&name, rspotify::model::SearchType::Track)
+                    .search_specific_type(
+                        &name,
+                        rspotify::model::SearchType::Track,
+                        CLI_SEARCH_LIMIT,
+                        0,
+                    )
                     .await?;
 
                 match results {
@@ -318,7 +340,7 @@ async fn handle_get_item_request(
 }
 
 async fn handle_search_request(client: &AppClient, query: String) -> Result<Vec<u8>> {
-    let search_result = client.search(&query).await?;
+    let search_result = client.search(&query, CLI_SEARCH_LIMIT, 0).await?;
 
     Ok(serde_json::to_vec(&search_result)?)
 }

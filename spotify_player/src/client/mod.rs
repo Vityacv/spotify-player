@@ -1,15 +1,16 @@
 use std::ops::Deref;
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Instant};
 
 use crate::state::Lyrics;
 use crate::{auth, config};
 use crate::{
     auth::AuthConfig,
     state::{
-        store_data_into_file_cache, Album, AlbumId, Artist, ArtistId, Category, Context, ContextId,
-        Device, FileCacheKey, Item, ItemId, MemoryCaches, Playback, PlaybackMetadata, Playlist,
-        PlaylistFolderItem, PlaylistId, SearchResults, SharedState, Show, ShowId, Track, TrackId,
-        UserId, TTL_CACHE_DURATION, USER_LIKED_TRACKS_ID, USER_RECENTLY_PLAYED_TRACKS_ID,
+        store_data_into_file_cache, Album, AlbumId, Artist, ArtistId, CachedSearchResults,
+        Category, Context, ContextId, Device, FileCacheKey, Item, ItemId, MemoryCaches, Playback,
+        PlaybackMetadata, Playlist, PlaylistFolderItem, PlaylistId, SearchPagination,
+        SearchResultCategory, SearchResults, SharedState, Show, ShowId, Track, TrackId, UserId,
+        TTL_CACHE_DURATION, USER_LIKED_TRACKS_ID, USER_RECENTLY_PLAYED_TRACKS_ID,
         USER_TOP_TRACKS_ID,
     },
 };
@@ -38,6 +39,7 @@ const PLAYBACK_TYPES: [&rspotify::model::AdditionalType; 2] = [
     &rspotify::model::AdditionalType::Track,
     &rspotify::model::AdditionalType::Episode,
 ];
+const SEARCH_PAGE_LIMIT: u32 = 50;
 
 /// The application's Spotify client
 #[derive(Clone)]
@@ -179,10 +181,9 @@ impl AppClient {
 
         if !connected {
             // if session is not connected (triggered by `new_streaming_connection`), connect to the session
-            session
-                .connect(creds, true)
-                .await
-                .context("connect to a session")?;
+            if let Err(err) = session.connect(creds, false).await {
+                return Err(err).context("connect to a session");
+            }
         }
 
         tracing::info!("Used a new session for Spotify client.");
@@ -414,7 +415,9 @@ impl AppClient {
                     &playlists,
                 )
                 .context("store user's playlists into the cache folder")?;
-                state.data.write().user_data.playlists = playlists;
+                let mut data = state.data.write();
+                data.user_data.playlists = playlists;
+                data.user_data.playlists_last_sync = Some(Instant::now());
             }
             ClientRequest::GetUserFollowedArtists => {
                 let artists = self.current_user_followed_artists().await?;
@@ -424,7 +427,9 @@ impl AppClient {
                     &artists,
                 )
                 .context("store user's followed artists into the cache folder")?;
-                state.data.write().user_data.followed_artists = artists;
+                let mut data = state.data.write();
+                data.user_data.followed_artists = artists;
+                data.user_data.followed_artists_last_sync = Some(Instant::now());
             }
             ClientRequest::GetUserSavedAlbums => {
                 let albums = self.current_user_saved_albums().await?;
@@ -434,7 +439,9 @@ impl AppClient {
                     &albums,
                 )
                 .context("store user's saved albums into the cache folder")?;
-                state.data.write().user_data.saved_albums = albums;
+                let mut data = state.data.write();
+                data.user_data.saved_albums = albums;
+                data.user_data.saved_albums_last_sync = Some(Instant::now());
             }
             ClientRequest::GetUserSavedShows => {
                 let shows = self.current_user_saved_shows().await?;
@@ -444,7 +451,9 @@ impl AppClient {
                     &shows,
                 )
                 .context("store user's saved shows into the cache folder")?;
-                state.data.write().user_data.saved_shows = shows;
+                let mut data = state.data.write();
+                data.user_data.saved_shows = shows;
+                data.user_data.saved_shows_last_sync = Some(Instant::now());
             }
             ClientRequest::GetUserTopTracks => {
                 let uri = &USER_TOP_TRACKS_ID.uri;
@@ -523,16 +532,60 @@ impl AppClient {
                         .insert(uri, context, *TTL_CACHE_DURATION);
                 }
             }
-            ClientRequest::Search(query) => {
-                if !state.data.read().caches.search.contains_key(&query) {
-                    let results = self.search(&query).await?;
+            ClientRequest::Search { query } => {
+                let results = self.search(&query, SEARCH_PAGE_LIMIT, 0).await?;
+                let mut cached = CachedSearchResults {
+                    results,
+                    pagination: SearchPagination::default(),
+                };
 
-                    state
-                        .data
-                        .write()
-                        .caches
-                        .search
-                        .insert(query, results, *TTL_CACHE_DURATION);
+                for category in [
+                    SearchResultCategory::Tracks,
+                    SearchResultCategory::Artists,
+                    SearchResultCategory::Albums,
+                    SearchResultCategory::Playlists,
+                    SearchResultCategory::Shows,
+                    SearchResultCategory::Episodes,
+                ] {
+                    let len = cached.results.len_for_category(category);
+                    let info = cached.pagination.info_mut(category);
+                    info.is_fetching = false;
+                    if len < SEARCH_PAGE_LIMIT as usize {
+                        info.is_exhausted = true;
+                    }
+                }
+
+                state
+                    .data
+                    .write()
+                    .caches
+                    .search
+                    .insert(query, cached, *TTL_CACHE_DURATION);
+            }
+            ClientRequest::SearchMore {
+                query,
+                category,
+                offset,
+            } => {
+                let partial = self
+                    .search_category_page(
+                        query.as_str(),
+                        category,
+                        SEARCH_PAGE_LIMIT,
+                        offset as u32,
+                    )
+                    .await?;
+
+                let mut data = state.data.write();
+                if let Some(mut entry) = data.caches.search.remove(&query) {
+                    let fetched_count = partial.len_for_category(category);
+                    entry.results.extend(partial);
+                    let info = entry.pagination.info_mut(category);
+                    info.is_fetching = false;
+                    if fetched_count < SEARCH_PAGE_LIMIT as usize {
+                        info.is_exhausted = true;
+                    }
+                    data.caches.search.insert(query, entry, *TTL_CACHE_DURATION);
                 }
             }
             ClientRequest::GetRadioTracks {
@@ -1001,87 +1054,93 @@ impl AppClient {
         Ok(tracks)
     }
 
-    /// Search for items (tracks, artists, albums, playlists) matching a given query
-    pub async fn search(&self, query: &str) -> Result<SearchResults> {
-        let (
-            track_result,
-            artist_result,
-            album_result,
-            playlist_result,
-            show_result,
-            episode_result,
-        ) = tokio::try_join!(
-            self.search_specific_type(query, rspotify::model::SearchType::Track),
-            self.search_specific_type(query, rspotify::model::SearchType::Artist),
-            self.search_specific_type(query, rspotify::model::SearchType::Album),
-            self.search_specific_type(query, rspotify::model::SearchType::Playlist),
-            self.search_specific_type(query, rspotify::model::SearchType::Show),
-            self.search_specific_type(query, rspotify::model::SearchType::Episode)
+    /// Search for items (tracks, artists, albums, playlists, shows, episodes) matching a given query
+    pub async fn search(&self, query: &str, limit: u32, offset: u32) -> Result<SearchResults> {
+        let (tracks, artists, albums, playlists, shows, episodes) = tokio::try_join!(
+            self.search_category_page(query, SearchResultCategory::Tracks, limit, offset),
+            self.search_category_page(query, SearchResultCategory::Artists, limit, offset),
+            self.search_category_page(query, SearchResultCategory::Albums, limit, offset),
+            self.search_category_page(query, SearchResultCategory::Playlists, limit, offset),
+            self.search_category_page(query, SearchResultCategory::Shows, limit, offset),
+            self.search_category_page(query, SearchResultCategory::Episodes, limit, offset)
         )?;
 
-        let (tracks, artists, albums, playlists, shows, episodes) = (
-            match track_result {
-                rspotify::model::SearchResult::Tracks(p) => p
-                    .items
-                    .into_iter()
-                    .filter_map(Track::try_from_full_track)
-                    .collect(),
-                _ => anyhow::bail!("expect a track search result"),
-            },
-            match artist_result {
-                rspotify::model::SearchResult::Artists(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect an artist search result"),
-            },
-            match album_result {
-                rspotify::model::SearchResult::Albums(p) => p
-                    .items
-                    .into_iter()
-                    .filter_map(Album::try_from_simplified_album)
-                    .collect(),
-                _ => anyhow::bail!("expect an album search result"),
-            },
-            match playlist_result {
-                rspotify::model::SearchResult::Playlists(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect a playlist search result"),
-            },
-            match show_result {
-                rspotify::model::SearchResult::Shows(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect a show search result"),
-            },
-            match episode_result {
-                rspotify::model::SearchResult::Episodes(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect a episode search result"),
-            },
-        );
-
-        Ok(SearchResults {
-            tracks,
-            artists,
-            albums,
-            playlists,
-            shows,
-            episodes,
-        })
+        let mut combined = SearchResults::default();
+        combined.extend(tracks);
+        combined.extend(artists);
+        combined.extend(albums);
+        combined.extend(playlists);
+        combined.extend(shows);
+        combined.extend(episodes);
+        Ok(combined)
     }
 
-    /// Search for items of a specific type matching a given query
+    /// Search for items of a specific type matching a given query with pagination support
     pub async fn search_specific_type(
         &self,
         query: &str,
         typ: rspotify::model::SearchType,
+        limit: u32,
+        offset: u32,
     ) -> Result<rspotify::model::SearchResult> {
         Ok(self
             .spotify
-            .search(query, typ, None, None, None, None)
+            .search(query, typ, None, None, Some(limit), Some(offset))
             .await?)
+    }
+
+    pub async fn search_category_page(
+        &self,
+        query: &str,
+        category: SearchResultCategory,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SearchResults> {
+        let search_type = match category {
+            SearchResultCategory::Tracks => rspotify::model::SearchType::Track,
+            SearchResultCategory::Artists => rspotify::model::SearchType::Artist,
+            SearchResultCategory::Albums => rspotify::model::SearchType::Album,
+            SearchResultCategory::Playlists => rspotify::model::SearchType::Playlist,
+            SearchResultCategory::Shows => rspotify::model::SearchType::Show,
+            SearchResultCategory::Episodes => rspotify::model::SearchType::Episode,
+        };
+
+        let result = self
+            .search_specific_type(query, search_type, limit, offset)
+            .await?;
+
+        let mut partial = SearchResults::default();
+        match (category, result) {
+            (SearchResultCategory::Tracks, rspotify::model::SearchResult::Tracks(p)) => {
+                partial.tracks = p
+                    .items
+                    .into_iter()
+                    .filter_map(Track::try_from_full_track)
+                    .collect();
+            }
+            (SearchResultCategory::Artists, rspotify::model::SearchResult::Artists(p)) => {
+                partial.artists = p.items.into_iter().map(std::convert::Into::into).collect();
+            }
+            (SearchResultCategory::Albums, rspotify::model::SearchResult::Albums(p)) => {
+                partial.albums = p
+                    .items
+                    .into_iter()
+                    .filter_map(Album::try_from_simplified_album)
+                    .collect();
+            }
+            (SearchResultCategory::Playlists, rspotify::model::SearchResult::Playlists(p)) => {
+                partial.playlists = p.items.into_iter().map(std::convert::Into::into).collect();
+            }
+            (SearchResultCategory::Shows, rspotify::model::SearchResult::Shows(p)) => {
+                partial.shows = p.items.into_iter().map(std::convert::Into::into).collect();
+            }
+            (SearchResultCategory::Episodes, rspotify::model::SearchResult::Episodes(p)) => {
+                partial.episodes = p.items.into_iter().map(std::convert::Into::into).collect();
+            }
+            _ => anyhow::bail!("unexpected search result for category {category:?}"),
+        }
+
+        Ok(partial)
     }
 
     /// Add a playable item to a playlist
@@ -1205,7 +1264,9 @@ impl AppClient {
                     self.current_user_saved_albums_add([album.id.as_ref()])
                         .await?;
                     // update the in-memory `user_data`
-                    state.data.write().user_data.saved_albums.insert(0, album);
+                    let mut data = state.data.write();
+                    data.user_data.saved_albums.insert(0, album);
+                    data.user_data.saved_albums_last_sync = Some(Instant::now());
                 }
             }
             Item::Artist(artist) => {
@@ -1213,12 +1274,9 @@ impl AppClient {
                 if !follows[0] {
                     self.user_follow_artists([artist.id.as_ref()]).await?;
                     // update the in-memory `user_data`
-                    state
-                        .data
-                        .write()
-                        .user_data
-                        .followed_artists
-                        .insert(0, artist);
+                    let mut data = state.data.write();
+                    data.user_data.followed_artists.insert(0, artist);
+                    data.user_data.followed_artists_last_sync = Some(Instant::now());
                 }
             }
             Item::Playlist(playlist) => {
@@ -1237,12 +1295,11 @@ impl AppClient {
                     if !follows[0] {
                         self.playlist_follow(playlist.id.as_ref(), None).await?;
                         // update the in-memory `user_data`
-                        state
-                            .data
-                            .write()
-                            .user_data
+                        let mut data = state.data.write();
+                        data.user_data
                             .playlists
                             .insert(0, PlaylistFolderItem::Playlist(playlist));
+                        data.user_data.playlists_last_sync = Some(Instant::now());
                     }
                 }
             }
@@ -1251,7 +1308,9 @@ impl AppClient {
                 if !follows[0] {
                     self.save_shows([show.id.as_ref()]).await?;
                     // update the in-memory `user_data`
-                    state.data.write().user_data.saved_shows.insert(0, show);
+                    let mut data = state.data.write();
+                    data.user_data.saved_shows.insert(0, show);
+                    data.user_data.saved_shows_last_sync = Some(Instant::now());
                 }
             }
         }
@@ -1267,44 +1326,35 @@ impl AppClient {
                 state.data.write().user_data.saved_tracks.remove(&uri);
             }
             ItemId::Album(id) => {
-                state
-                    .data
-                    .write()
-                    .user_data
-                    .saved_albums
-                    .retain(|a| a.id != id);
-                self.current_user_saved_albums_delete([id]).await?;
+                self.current_user_saved_albums_delete([id.clone()]).await?;
+                let mut data = state.data.write();
+                data.user_data.saved_albums.retain(|a| a.id != id);
+                data.user_data.saved_albums_last_sync = Some(Instant::now());
             }
             ItemId::Artist(id) => {
-                state
-                    .data
-                    .write()
-                    .user_data
-                    .followed_artists
-                    .retain(|a| a.id != id);
-                self.user_unfollow_artists([id]).await?;
+                self.user_unfollow_artists([id.clone()]).await?;
+                let mut data = state.data.write();
+                data.user_data.followed_artists.retain(|a| a.id != id);
+                data.user_data.followed_artists_last_sync = Some(Instant::now());
             }
             ItemId::Playlist(id) => {
-                state
-                    .data
-                    .write()
-                    .user_data
-                    .playlists
-                    .retain(|item| match item {
-                        PlaylistFolderItem::Playlist(p) => p.id != id,
-                        PlaylistFolderItem::Folder(_) => true,
-                    });
-                self.playlist_unfollow(id).await?;
+                self.playlist_unfollow(id.clone()).await?;
+                let mut data = state.data.write();
+                data.user_data.playlists.retain(|item| match item {
+                    PlaylistFolderItem::Playlist(p) => p.id != id,
+                    PlaylistFolderItem::Folder(_) => true,
+                });
+                data.user_data.playlists_last_sync = Some(Instant::now());
             }
             ItemId::Show(id) => {
-                state
-                    .data
-                    .write()
-                    .user_data
-                    .saved_shows
-                    .retain(|s| s.id != id);
-                self.remove_users_saved_shows([id], Some(rspotify::model::Market::FromToken))
-                    .await?;
+                self.remove_users_saved_shows(
+                    [id.clone()],
+                    Some(rspotify::model::Market::FromToken),
+                )
+                .await?;
+                let mut data = state.data.write();
+                data.user_data.saved_shows.retain(|s| s.id != id);
+                data.user_data.saved_shows_last_sync = Some(Instant::now());
             }
         }
         Ok(())

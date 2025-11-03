@@ -83,6 +83,38 @@ pub struct SearchResults {
     pub episodes: Vec<Episode>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SearchResultCategory {
+    Tracks,
+    Artists,
+    Albums,
+    Playlists,
+    Shows,
+    Episodes,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PaginationInfo {
+    pub is_fetching: bool,
+    pub is_exhausted: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SearchPagination {
+    pub tracks: PaginationInfo,
+    pub artists: PaginationInfo,
+    pub albums: PaginationInfo,
+    pub playlists: PaginationInfo,
+    pub shows: PaginationInfo,
+    pub episodes: PaginationInfo,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CachedSearchResults {
+    pub results: SearchResults,
+    pub pagination: SearchPagination,
+}
+
 #[derive(Debug)]
 /// A track order
 pub enum TrackOrder {
@@ -316,6 +348,52 @@ impl TrackOrder {
             Self::Album => x.album_info().cmp(&y.album_info()),
             Self::Duration => x.duration.cmp(&y.duration),
             Self::Artists => x.artists_info().cmp(&y.artists_info()),
+        }
+    }
+}
+
+impl SearchResults {
+    pub fn extend(&mut self, other: SearchResults) {
+        self.tracks.extend(other.tracks);
+        self.artists.extend(other.artists);
+        self.albums.extend(other.albums);
+        self.playlists.extend(other.playlists);
+        self.shows.extend(other.shows);
+        self.episodes.extend(other.episodes);
+    }
+
+    pub fn len_for_category(&self, category: SearchResultCategory) -> usize {
+        match category {
+            SearchResultCategory::Tracks => self.tracks.len(),
+            SearchResultCategory::Artists => self.artists.len(),
+            SearchResultCategory::Albums => self.albums.len(),
+            SearchResultCategory::Playlists => self.playlists.len(),
+            SearchResultCategory::Shows => self.shows.len(),
+            SearchResultCategory::Episodes => self.episodes.len(),
+        }
+    }
+}
+
+impl SearchPagination {
+    pub fn info(&self, category: SearchResultCategory) -> &PaginationInfo {
+        match category {
+            SearchResultCategory::Tracks => &self.tracks,
+            SearchResultCategory::Artists => &self.artists,
+            SearchResultCategory::Albums => &self.albums,
+            SearchResultCategory::Playlists => &self.playlists,
+            SearchResultCategory::Shows => &self.shows,
+            SearchResultCategory::Episodes => &self.episodes,
+        }
+    }
+
+    pub fn info_mut(&mut self, category: SearchResultCategory) -> &mut PaginationInfo {
+        match category {
+            SearchResultCategory::Tracks => &mut self.tracks,
+            SearchResultCategory::Artists => &mut self.artists,
+            SearchResultCategory::Albums => &mut self.albums,
+            SearchResultCategory::Playlists => &mut self.playlists,
+            SearchResultCategory::Shows => &mut self.shows,
+            SearchResultCategory::Episodes => &mut self.episodes,
         }
     }
 }

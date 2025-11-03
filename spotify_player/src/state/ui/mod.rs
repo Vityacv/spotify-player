@@ -10,7 +10,7 @@ pub type UIStateGuard<'a> = parking_lot::MutexGuard<'a, UIState>;
 mod page;
 mod popup;
 
-use super::TracksId;
+use super::{model::SearchResultCategory, TracksId};
 
 pub use page::*;
 pub use popup::*;
@@ -31,6 +31,8 @@ pub struct UIState {
     pub theme: config::Theme,
     pub input_key_sequence: key::KeySequence,
     pub orientation: ui::Orientation,
+    pub last_mouse_click: Option<(std::time::Instant, u16, u16)>,
+    pub pending_client_requests: Vec<PendingClientRequest>,
 
     pub history: Vec<PageState>,
     pub popup: Option<PopupState>,
@@ -38,6 +40,9 @@ pub struct UIState {
     /// The rectangle representing the playback progress bar,
     /// which is mainly used to handle mouse click events (for seeking command)
     pub playback_progress_bar_rect: ratatui::layout::Rect,
+    pub search_layout: SearchLayout,
+    pub library_layout: LibraryLayout,
+    pub context_track_table_rect: Option<ratatui::layout::Rect>,
 
     /// Count prefix for vim-style navigation (e.g., 5j, 10k)
     pub count_prefix: Option<usize>,
@@ -112,18 +117,77 @@ impl Default for UIState {
                     Orientation::default()
                 }
             },
+            last_mouse_click: None,
 
             history: vec![PageState::Library {
                 state: LibraryPageUIState::new(),
             }],
             popup: None,
+            pending_client_requests: Vec::new(),
 
             playback_progress_bar_rect: Rect::default(),
+            search_layout: SearchLayout::default(),
+            library_layout: LibraryLayout::default(),
+            context_track_table_rect: None,
 
             count_prefix: None,
 
             #[cfg(feature = "image")]
             last_cover_image_render_info: ImageRenderInfo::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SearchLayout {
+    pub valid: bool,
+    pub input: Rect,
+    pub tracks: Rect,
+    pub albums: Rect,
+    pub artists: Rect,
+    pub playlists: Rect,
+    pub shows: Rect,
+    pub episodes: Rect,
+}
+
+impl Default for SearchLayout {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            input: Rect::default(),
+            tracks: Rect::default(),
+            albums: Rect::default(),
+            artists: Rect::default(),
+            playlists: Rect::default(),
+            shows: Rect::default(),
+            episodes: Rect::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LibraryLayout {
+    pub valid: bool,
+    pub playlists: Rect,
+    pub albums: Rect,
+    pub artists: Rect,
+}
+
+#[derive(Debug)]
+pub enum PendingClientRequest {
+    SearchMore {
+        query: String,
+        category: SearchResultCategory,
+    },
+}
+
+impl Default for LibraryLayout {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            playlists: Rect::default(),
+            albums: Rect::default(),
+            artists: Rect::default(),
         }
     }
 }

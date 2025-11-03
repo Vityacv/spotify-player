@@ -185,11 +185,23 @@ impl Default for KeymapConfig {
                     command: Command::LibraryPage,
                 },
                 Keymap {
+                    key_sequence: "f1".into(),
+                    command: Command::LibraryPage,
+                },
+                Keymap {
                     key_sequence: "g s".into(),
                     command: Command::SearchPage,
                 },
                 Keymap {
+                    key_sequence: "f2".into(),
+                    command: Command::SearchPage,
+                },
+                Keymap {
                     key_sequence: "g b".into(),
+                    command: Command::BrowsePage,
+                },
+                Keymap {
+                    key_sequence: "f3".into(),
                     command: Command::BrowsePage,
                 },
                 Keymap {

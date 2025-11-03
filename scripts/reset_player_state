@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Remove cached tokens and config for spotify_player so the next launch starts clean.
+rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/spotify_player"
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/spotify-player"
+
+echo "spotify_player cache and config cleared."

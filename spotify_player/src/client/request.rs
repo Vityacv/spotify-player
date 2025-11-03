@@ -1,5 +1,6 @@
 use crate::state::{
-    AlbumId, Category, ContextId, Item, ItemId, PlayableId, Playback, PlaylistId, TrackId,
+    AlbumId, Category, ContextId, Item, ItemId, PlayableId, Playback, PlaylistId,
+    SearchResultCategory, TrackId,
 };
 
 #[derive(Clone, Debug)]
@@ -39,7 +40,14 @@ pub enum ClientRequest {
         seed_uri: String,
         seed_name: String,
     },
-    Search(String),
+    Search {
+        query: String,
+    },
+    SearchMore {
+        query: String,
+        category: SearchResultCategory,
+        offset: usize,
+    },
     AddPlayableToQueue(PlayableId<'static>),
     AddAlbumToQueue(AlbumId<'static>),
     AddPlayableToPlaylist(PlaylistId<'static>, PlayableId<'static>),

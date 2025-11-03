@@ -327,6 +327,11 @@ fn handle_command_for_track_table_window(
         }
         Command::ShowActionsOnSelectedItem => {
             let actions = command::construct_track_actions(filtered_tracks[id], data);
+            tracing::info!(
+                "Selected track '{}' actions = {:?}",
+                filtered_tracks[id].name,
+                actions
+            );
             ui.popup = Some(PopupState::ActionList(
                 Box::new(ActionListItem::Track(tracks[id].clone(), actions)),
                 ListState::default(),

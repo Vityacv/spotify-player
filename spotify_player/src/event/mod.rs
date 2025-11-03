@@ -10,9 +10,10 @@ use crate::{
         ActionListItem, Album, AlbumId, Artist, ArtistFocusState, ArtistId, ArtistPopupAction,
         BrowsePageUIState, Context, ContextId, ContextPageType, ContextPageUIState, DataReadGuard,
         Focusable, Id, Item, ItemId, LibraryFocusState, LibraryPageUIState, PageState, PageType,
-        PlayableId, Playback, PlaylistCreateCurrentField, PlaylistFolderItem, PlaylistId,
-        PlaylistPopupAction, PopupState, SearchFocusState, SearchPageUIState, SharedState, ShowId,
-        Track, TrackId, TrackOrder, UIStateGuard, USER_LIKED_TRACKS_ID,
+        PendingClientRequest, PlayableId, Playback, PlaylistCreateCurrentField, PlaylistFolderItem,
+        PlaylistId, PlaylistPopupAction, PopupState, SearchFocusState, SearchPageUIState,
+        SearchResultCategory, SharedState, ShowId, Track, TrackId, TrackOrder, UIStateGuard,
+        LIBRARY_REFRESH_TTL, TTL_CACHE_DURATION, USER_LIKED_TRACKS_ID,
         USER_RECENTLY_PLAYED_TRACKS_ID, USER_TOP_TRACKS_ID,
     },
     ui::{single_line_input::LineInput, Orientation},
@@ -30,6 +31,81 @@ mod clipboard;
 mod page;
 mod popup;
 mod window;
+
+#[derive(Clone, Copy, Debug)]
+enum ContextTrackSource {
+    Album,
+    Playlist,
+    Tracks,
+    ArtistTopTracks,
+}
+
+const SEARCH_PREFETCH_THRESHOLD: usize = 5;
+
+pub(super) fn is_downward_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::SelectNextOrScrollDown
+            | Command::PageSelectNextOrScrollDown
+            | Command::SelectLastOrScrollToBottom
+    )
+}
+
+pub(super) fn maybe_queue_search_prefetch(
+    ui: &mut UIStateGuard,
+    data: &DataReadGuard,
+    query: &str,
+    category: SearchResultCategory,
+    list_len: usize,
+) {
+    if list_len == 0 {
+        return;
+    }
+
+    let Some(selected) = ui.current_page_mut().selected() else {
+        return;
+    };
+
+    if selected + SEARCH_PREFETCH_THRESHOLD < list_len {
+        return;
+    }
+
+    if let Some(entry) = data.caches.search.get(query) {
+        let info = entry.pagination.info(category);
+        if info.is_exhausted || info.is_fetching {
+            return;
+        }
+    } else {
+        return;
+    }
+
+    if ui.pending_client_requests.iter().any(|req| {
+        matches!(
+            req,
+            PendingClientRequest::SearchMore {
+                query: existing_query,
+                category: existing_category,
+            } if existing_query == query && *existing_category == category
+        )
+    }) {
+        return;
+    }
+
+    ui.pending_client_requests
+        .push(PendingClientRequest::SearchMore {
+            query: query.to_string(),
+            category,
+        });
+}
+
+impl ContextTrackSource {
+    fn required_focus(self) -> Option<ArtistFocusState> {
+        match self {
+            ContextTrackSource::ArtistTopTracks => Some(ArtistFocusState::TopTracks),
+            _ => None,
+        }
+    }
+}
 
 /// Start a terminal event handler (key pressed, mouse clicked, etc)
 pub fn start_event_handler(state: &SharedState, client_pub: &flume::Sender<ClientRequest>) {
@@ -65,30 +141,827 @@ fn handle_mouse_event(
     client_pub: &flume::Sender<ClientRequest>,
     state: &SharedState,
 ) -> Result<()> {
-    // a left click event
-    if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = event.kind
-    {
-        tracing::debug!("Handling mouse event: {event:?}");
-        let rect = state.ui.lock().playback_progress_bar_rect;
-        if event.row == rect.y {
-            // calculate the seek position (in ms) based on the mouse click position,
-            // the progress bar's width and the track's duration (in ms)
-            let player = state.player.read();
-            let duration = match player.currently_playing() {
-                Some(rspotify::model::PlayableItem::Track(track)) => Some(track.duration),
-                Some(rspotify::model::PlayableItem::Episode(episode)) => Some(episode.duration),
-                Some(rspotify::model::PlayableItem::Unknown(_)) | None => None,
-            };
-            if let Some(duration) = duration {
-                let position_ms =
-                    (duration.num_milliseconds()) * i64::from(event.column) / i64::from(rect.width);
-                client_pub.send(ClientRequest::Player(PlayerRequest::SeekTrack(
-                    chrono::Duration::try_milliseconds(position_ms).unwrap(),
-                )))?;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use std::time::{Duration, Instant};
+
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            tracing::debug!("Handling mouse event: {event:?}");
+            let rect = state.ui.lock().playback_progress_bar_rect;
+            if event.row == rect.y {
+                // calculate the seek position (in ms) based on the mouse click position,
+                // the progress bar's width and the track's duration (in ms)
+                let player = state.player.read();
+                let duration = match player.currently_playing() {
+                    Some(rspotify::model::PlayableItem::Track(track)) => Some(track.duration),
+                    Some(rspotify::model::PlayableItem::Episode(episode)) => Some(episode.duration),
+                    Some(rspotify::model::PlayableItem::Unknown(_)) | None => None,
+                };
+                if let Some(duration) = duration {
+                    let position_ms = (duration.num_milliseconds()) * i64::from(event.column)
+                        / i64::from(rect.width);
+                    client_pub.send(ClientRequest::Player(PlayerRequest::SeekTrack(
+                        chrono::Duration::try_milliseconds(position_ms).unwrap(),
+                    )))?;
+                }
             }
+
+            // Handle search page list selection
+            let mut ui = state.ui.lock();
+            let now = Instant::now();
+            let is_double_click = ui
+                .last_mouse_click
+                .map(|(ts, _, row)| ts.elapsed() <= Duration::from_millis(500) && row == event.row)
+                .unwrap_or(false);
+            ui.last_mouse_click = Some((now, event.column, event.row));
+
+            if let PageState::Search { .. } = ui.current_page() {
+                let layout = ui.search_layout;
+                if layout.valid {
+                    let current_query = match ui.current_page() {
+                        PageState::Search { current_query, .. } => current_query.clone(),
+                        _ => unreachable!(),
+                    };
+
+                    let data = state.data.read();
+                    let search_results = data.caches.search.get(&current_query);
+
+                    let filtered_tracks = search_results
+                        .map(|s| ui.search_filtered_items(&s.results.tracks))
+                        .unwrap_or_default();
+                    let filtered_albums = search_results
+                        .map(|s| ui.search_filtered_items(&s.results.albums))
+                        .unwrap_or_default();
+                    let filtered_artists = search_results
+                        .map(|s| ui.search_filtered_items(&s.results.artists))
+                        .unwrap_or_default();
+                    let playlist_items: Vec<PlaylistFolderItem> = search_results
+                        .map(|s| {
+                            ui.search_filtered_items(&s.results.playlists)
+                                .into_iter()
+                                .map(|p| PlaylistFolderItem::Playlist(p.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let filtered_playlists: Vec<&PlaylistFolderItem> =
+                        playlist_items.iter().collect();
+                    let filtered_shows = search_results
+                        .map(|s| ui.search_filtered_items(&s.results.shows))
+                        .unwrap_or_default();
+                    let filtered_episodes = search_results
+                        .map(|s| ui.search_filtered_items(&s.results.episodes))
+                        .unwrap_or_default();
+
+                    let PageState::Search {
+                        state: search_state,
+                        ..
+                    } = ui.current_page_mut()
+                    else {
+                        unreachable!();
+                    };
+
+                    let within = |rect: ratatui::layout::Rect| -> bool {
+                        event.column >= rect.x
+                            && event.column < rect.x.saturating_add(rect.width)
+                            && event.row >= rect.y
+                            && event.row < rect.y.saturating_add(rect.height)
+                    };
+
+                    let mut handled = false;
+                    let mut clicked_focus: Option<SearchFocusState> = None;
+
+                    if within(layout.input) {
+                        search_state.focus = SearchFocusState::Input;
+                        handled = true;
+                    }
+
+                    let mut handle_list_click =
+                        |rect: ratatui::layout::Rect,
+                         list_state: &mut ratatui::widgets::ListState,
+                         len: usize,
+                         focus: SearchFocusState| {
+                            if !within(rect) {
+                                return;
+                            }
+
+                            search_state.focus = focus;
+                            handled = true;
+                            clicked_focus = Some(focus);
+
+                            if len == 0 || rect.height == 0 {
+                                return;
+                            }
+
+                            let relative = event.row.saturating_sub(rect.y) as usize;
+                            let height = rect.height as usize;
+                            if relative >= height {
+                                return;
+                            }
+
+                            let mut index = list_state.offset().saturating_add(relative);
+                            if index >= len {
+                                index = len - 1;
+                            }
+
+                            let mut new_offset = list_state.offset();
+                            if index < new_offset {
+                                new_offset = index;
+                            } else if height > 0 && index >= new_offset + height {
+                                new_offset = index + 1 - height;
+                            }
+
+                            list_state.select(Some(index));
+                            *list_state.offset_mut() = new_offset;
+                        };
+
+                    handle_list_click(
+                        layout.tracks,
+                        &mut search_state.track_list,
+                        filtered_tracks.len(),
+                        SearchFocusState::Tracks,
+                    );
+                    handle_list_click(
+                        layout.albums,
+                        &mut search_state.album_list,
+                        filtered_albums.len(),
+                        SearchFocusState::Albums,
+                    );
+                    handle_list_click(
+                        layout.artists,
+                        &mut search_state.artist_list,
+                        filtered_artists.len(),
+                        SearchFocusState::Artists,
+                    );
+                    handle_list_click(
+                        layout.playlists,
+                        &mut search_state.playlist_list,
+                        filtered_playlists.len(),
+                        SearchFocusState::Playlists,
+                    );
+                    handle_list_click(
+                        layout.shows,
+                        &mut search_state.show_list,
+                        filtered_shows.len(),
+                        SearchFocusState::Shows,
+                    );
+                    handle_list_click(
+                        layout.episodes,
+                        &mut search_state.episode_list,
+                        filtered_episodes.len(),
+                        SearchFocusState::Episodes,
+                    );
+
+                    if handled {
+                        if let Some(focus) = clicked_focus {
+                            let (category, len) = match focus {
+                                SearchFocusState::Tracks => {
+                                    (SearchResultCategory::Tracks, filtered_tracks.len())
+                                }
+                                SearchFocusState::Albums => {
+                                    (SearchResultCategory::Albums, filtered_albums.len())
+                                }
+                                SearchFocusState::Artists => {
+                                    (SearchResultCategory::Artists, filtered_artists.len())
+                                }
+                                SearchFocusState::Playlists => {
+                                    (SearchResultCategory::Playlists, filtered_playlists.len())
+                                }
+                                SearchFocusState::Shows => {
+                                    (SearchResultCategory::Shows, filtered_shows.len())
+                                }
+                                SearchFocusState::Episodes => {
+                                    (SearchResultCategory::Episodes, filtered_episodes.len())
+                                }
+                                SearchFocusState::Input => (SearchResultCategory::Tracks, 0),
+                            };
+                            if focus != SearchFocusState::Input {
+                                maybe_queue_search_prefetch(
+                                    &mut ui,
+                                    &data,
+                                    &current_query,
+                                    category,
+                                    len,
+                                );
+                            }
+                        }
+
+                        if is_double_click {
+                            if let Some(focus) = clicked_focus {
+                                match focus {
+                                    SearchFocusState::Tracks => {
+                                        let _ = window::handle_command_for_track_list_window(
+                                            Command::ChooseSelected,
+                                            client_pub,
+                                            &filtered_tracks,
+                                            &data,
+                                            &mut ui,
+                                        );
+                                    }
+                                    SearchFocusState::Albums => {
+                                        let _ = window::handle_command_for_album_list_window(
+                                            Command::ChooseSelected,
+                                            &filtered_albums,
+                                            &data,
+                                            &mut ui,
+                                            client_pub,
+                                        );
+                                    }
+                                    SearchFocusState::Artists => {
+                                        window::handle_command_for_artist_list_window(
+                                            Command::ChooseSelected,
+                                            &filtered_artists,
+                                            &data,
+                                            &mut ui,
+                                        );
+                                    }
+                                    SearchFocusState::Playlists => {
+                                        window::handle_command_for_playlist_list_window(
+                                            Command::ChooseSelected,
+                                            &filtered_playlists,
+                                            &data,
+                                            &mut ui,
+                                        );
+                                    }
+                                    SearchFocusState::Shows => {
+                                        window::handle_command_for_show_list_window(
+                                            Command::ChooseSelected,
+                                            &filtered_shows,
+                                            &data,
+                                            &mut ui,
+                                        );
+                                    }
+                                    SearchFocusState::Episodes => {
+                                        let _ = window::handle_command_for_episode_list_window(
+                                            Command::ChooseSelected,
+                                            client_pub,
+                                            &filtered_episodes,
+                                            &data,
+                                            &mut ui,
+                                        );
+                                    }
+                                    SearchFocusState::Input => {}
+                                }
+                            }
+                            ui.count_prefix = None;
+                            return Ok(());
+                        }
+
+                        ui.count_prefix = None;
+                        return Ok(());
+                    }
+                    drop(data);
+                }
+            }
+
+            // Handle library page list selection
+            if let PageState::Library { .. } = ui.current_page() {
+                let layout = ui.library_layout;
+                if layout.valid {
+                    let playlist_folder_id = match ui.current_page() {
+                        PageState::Library { state } => state.playlist_folder_id,
+                        _ => unreachable!(),
+                    };
+
+                    let data = state.data.read();
+                    let folder_items = data.user_data.folder_playlists_items(playlist_folder_id);
+                    let filtered_playlists = ui
+                        .search_filtered_items(&folder_items)
+                        .into_iter()
+                        .map(|item| *item)
+                        .collect::<Vec<&PlaylistFolderItem>>();
+                    let filtered_albums = ui.search_filtered_items(&data.user_data.saved_albums);
+                    let filtered_artists =
+                        ui.search_filtered_items(&data.user_data.followed_artists);
+
+                    let PageState::Library { state: page_state } = ui.current_page_mut() else {
+                        unreachable!();
+                    };
+
+                    let mut handled = false;
+                    let mut clicked_focus: Option<LibraryFocusState> = None;
+
+                    let within = |rect: ratatui::layout::Rect| -> bool {
+                        event.column >= rect.x
+                            && event.column < rect.x.saturating_add(rect.width)
+                            && event.row >= rect.y
+                            && event.row < rect.y.saturating_add(rect.height)
+                    };
+
+                    let mut handle_list_click =
+                        |rect: ratatui::layout::Rect,
+                         list_state: &mut ratatui::widgets::ListState,
+                         len: usize,
+                         focus: LibraryFocusState| {
+                            if !within(rect) {
+                                return;
+                            }
+
+                            page_state.focus = focus;
+                            handled = true;
+                            clicked_focus = Some(focus);
+
+                            if len == 0 || rect.height == 0 {
+                                return;
+                            }
+
+                            let relative = event.row.saturating_sub(rect.y) as usize;
+                            let height = rect.height as usize;
+                            if relative >= height {
+                                return;
+                            }
+
+                            let mut index = list_state.offset().saturating_add(relative);
+                            if index >= len {
+                                index = len - 1;
+                            }
+
+                            let mut new_offset = list_state.offset();
+                            if index < new_offset {
+                                new_offset = index;
+                            } else if height > 0 && index >= new_offset + height {
+                                new_offset = index + 1 - height;
+                            }
+
+                            list_state.select(Some(index));
+                            *list_state.offset_mut() = new_offset;
+                        };
+
+                    handle_list_click(
+                        layout.playlists,
+                        &mut page_state.playlist_list,
+                        filtered_playlists.len(),
+                        LibraryFocusState::Playlists,
+                    );
+                    handle_list_click(
+                        layout.albums,
+                        &mut page_state.saved_album_list,
+                        filtered_albums.len(),
+                        LibraryFocusState::SavedAlbums,
+                    );
+                    handle_list_click(
+                        layout.artists,
+                        &mut page_state.followed_artist_list,
+                        filtered_artists.len(),
+                        LibraryFocusState::FollowedArtists,
+                    );
+
+                    if handled {
+                        if is_double_click {
+                            if let Some(focus) = clicked_focus {
+                                match focus {
+                                    LibraryFocusState::Playlists => {
+                                        let _ = window::handle_command_for_playlist_list_window(
+                                            Command::ChooseSelected,
+                                            &filtered_playlists,
+                                            &data,
+                                            &mut ui,
+                                        );
+                                    }
+                                    LibraryFocusState::SavedAlbums => {
+                                        let _ = window::handle_command_for_album_list_window(
+                                            Command::ChooseSelected,
+                                            &filtered_albums,
+                                            &data,
+                                            &mut ui,
+                                            client_pub,
+                                        );
+                                    }
+                                    LibraryFocusState::FollowedArtists => {
+                                        window::handle_command_for_artist_list_window(
+                                            Command::ChooseSelected,
+                                            &filtered_artists,
+                                            &data,
+                                            &mut ui,
+                                        );
+                                    }
+                                }
+                            }
+                            ui.count_prefix = None;
+                            return Ok(());
+                        }
+
+                        ui.count_prefix = None;
+                        return Ok(());
+                    }
+                    drop(data);
+                }
+            }
+
+            let within = |rect: ratatui::layout::Rect| -> bool {
+                event.column >= rect.x
+                    && event.column < rect.x.saturating_add(rect.width)
+                    && event.row >= rect.y
+                    && event.row < rect.y.saturating_add(rect.height)
+            };
+
+            if let Some(track_rect) = ui.context_track_table_rect {
+                if within(track_rect) {
+                    let relative = event.row.saturating_sub(track_rect.y);
+                    if relative > 0 {
+                        let row_in_view = (relative - 1) as usize;
+                        let context_info = || -> Option<(ContextId, ContextTrackSource, usize)> {
+                            if let PageState::Context {
+                                id: Some(context_id),
+                                state: Some(context_state),
+                                ..
+                            } = ui.current_page()
+                            {
+                                match context_state {
+                                    ContextPageUIState::Album { track_table } => Some((
+                                        context_id.clone(),
+                                        ContextTrackSource::Album,
+                                        track_table.offset(),
+                                    )),
+                                    ContextPageUIState::Playlist { track_table } => Some((
+                                        context_id.clone(),
+                                        ContextTrackSource::Playlist,
+                                        track_table.offset(),
+                                    )),
+                                    ContextPageUIState::Tracks { track_table } => Some((
+                                        context_id.clone(),
+                                        ContextTrackSource::Tracks,
+                                        track_table.offset(),
+                                    )),
+                                    ContextPageUIState::Artist {
+                                        top_track_table, ..
+                                    } => Some((
+                                        context_id.clone(),
+                                        ContextTrackSource::ArtistTopTracks,
+                                        top_track_table.offset(),
+                                    )),
+                                    ContextPageUIState::Show { .. } => None,
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some((context_id_clone, source, offset)) = context_info() {
+                            let mut handled_context = false;
+                            {
+                                let data = state.data.read();
+                                let context_uri = context_id_clone.uri();
+                                if let Some(context) = data.caches.context.get(&context_uri) {
+                                    let tracks_slice = match (source, context) {
+                                        (
+                                            ContextTrackSource::Album,
+                                            Context::Album { tracks, .. },
+                                        ) => Some(tracks.as_slice()),
+                                        (
+                                            ContextTrackSource::Playlist,
+                                            Context::Playlist { tracks, .. },
+                                        ) => Some(tracks.as_slice()),
+                                        (
+                                            ContextTrackSource::Tracks,
+                                            Context::Tracks { tracks, .. },
+                                        ) => Some(tracks.as_slice()),
+                                        (
+                                            ContextTrackSource::ArtistTopTracks,
+                                            Context::Artist { top_tracks, .. },
+                                        ) => Some(top_tracks.as_slice()),
+                                        _ => None,
+                                    };
+
+                                    if let Some(tracks_slice) = tracks_slice {
+                                        let filtered_tracks =
+                                            ui.search_filtered_items(tracks_slice);
+                                        let target_index = offset.saturating_add(row_in_view);
+                                        if target_index < filtered_tracks.len() {
+                                            if let PageState::Context {
+                                                state: Some(context_state_mut),
+                                                ..
+                                            } = ui.current_page_mut()
+                                            {
+                                                match (context_state_mut, source) {
+                                                    (
+                                                        ContextPageUIState::Album { track_table },
+                                                        ContextTrackSource::Album,
+                                                    ) => {
+                                                        track_table.select(Some(target_index));
+                                                    }
+                                                    (
+                                                        ContextPageUIState::Playlist {
+                                                            track_table,
+                                                        },
+                                                        ContextTrackSource::Playlist,
+                                                    ) => {
+                                                        track_table.select(Some(target_index));
+                                                    }
+                                                    (
+                                                        ContextPageUIState::Tracks { track_table },
+                                                        ContextTrackSource::Tracks,
+                                                    ) => {
+                                                        track_table.select(Some(target_index));
+                                                    }
+                                                    (
+                                                        ContextPageUIState::Artist {
+                                                            top_track_table,
+                                                            focus,
+                                                            ..
+                                                        },
+                                                        ContextTrackSource::ArtistTopTracks,
+                                                    ) => {
+                                                        *focus = ArtistFocusState::TopTracks;
+                                                        top_track_table.select(Some(target_index));
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+
+                                            ui.count_prefix = None;
+
+                                            if is_double_click {
+                                                let _ = window::handle_command_for_focused_context_window(
+                                                    Command::ChooseSelected,
+                                                    client_pub,
+                                                    &mut ui,
+                                                    state,
+                                                );
+                                            }
+
+                                            handled_context = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if handled_context {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(())
         }
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            let mut ui = state.ui.lock();
+            let command = if matches!(event.kind, MouseEventKind::ScrollDown) {
+                Command::PageSelectNextOrScrollDown
+            } else {
+                Command::PageSelectPreviousOrScrollUp
+            };
+            let within = |rect: ratatui::layout::Rect| -> bool {
+                event.column >= rect.x
+                    && event.column < rect.x.saturating_add(rect.width)
+                    && event.row >= rect.y
+                    && event.row < rect.y.saturating_add(rect.height)
+            };
+
+            if let Some(track_rect) = ui.context_track_table_rect {
+                if within(track_rect) {
+                    let source = if let PageState::Context {
+                        state: Some(context_state),
+                        ..
+                    } = ui.current_page()
+                    {
+                        match context_state {
+                            ContextPageUIState::Album { .. } => Some(ContextTrackSource::Album),
+                            ContextPageUIState::Playlist { .. } => {
+                                Some(ContextTrackSource::Playlist)
+                            }
+                            ContextPageUIState::Tracks { .. } => Some(ContextTrackSource::Tracks),
+                            ContextPageUIState::Artist { .. } => {
+                                Some(ContextTrackSource::ArtistTopTracks)
+                            }
+                            ContextPageUIState::Show { .. } => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(source) = source {
+                        if let Some(required_focus) = source.required_focus() {
+                            if let PageState::Context {
+                                state: Some(ContextPageUIState::Artist { focus, .. }),
+                                ..
+                            } = ui.current_page_mut()
+                            {
+                                *focus = required_focus;
+                            }
+                        }
+
+                        if window::handle_command_for_focused_context_window(
+                            command, client_pub, &mut ui, state,
+                        )? {
+                            ui.count_prefix = None;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            if let PageState::Search { .. } = ui.current_page() {
+                let layout = ui.search_layout;
+                if layout.valid {
+                    let within = |rect: ratatui::layout::Rect| -> bool {
+                        event.column >= rect.x
+                            && event.column < rect.x.saturating_add(rect.width)
+                            && event.row >= rect.y
+                            && event.row < rect.y.saturating_add(rect.height)
+                    };
+
+                    let target_focus = if within(layout.tracks) {
+                        Some(SearchFocusState::Tracks)
+                    } else if within(layout.albums) {
+                        Some(SearchFocusState::Albums)
+                    } else if within(layout.artists) {
+                        Some(SearchFocusState::Artists)
+                    } else if within(layout.playlists) {
+                        Some(SearchFocusState::Playlists)
+                    } else if within(layout.shows) {
+                        Some(SearchFocusState::Shows)
+                    } else if within(layout.episodes) {
+                        Some(SearchFocusState::Episodes)
+                    } else {
+                        None
+                    };
+
+                    if let Some(focus) = target_focus {
+                        let current_query = match ui.current_page() {
+                            PageState::Search { current_query, .. } => current_query.clone(),
+                            _ => unreachable!(),
+                        };
+
+                        if let PageState::Search { state, .. } = ui.current_page_mut() {
+                            state.focus = focus;
+                        }
+
+                        let data = state.data.read();
+                        let search_results = data.caches.search.get(&current_query);
+
+                        let filtered_tracks = search_results
+                            .map(|s| ui.search_filtered_items(&s.results.tracks))
+                            .unwrap_or_default();
+                        let filtered_albums = search_results
+                            .map(|s| ui.search_filtered_items(&s.results.albums))
+                            .unwrap_or_default();
+                        let filtered_artists = search_results
+                            .map(|s| ui.search_filtered_items(&s.results.artists))
+                            .unwrap_or_default();
+                        let playlist_items: Vec<PlaylistFolderItem> = search_results
+                            .map(|s| {
+                                ui.search_filtered_items(&s.results.playlists)
+                                    .into_iter()
+                                    .map(|p| PlaylistFolderItem::Playlist(p.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let filtered_playlists: Vec<&PlaylistFolderItem> =
+                            playlist_items.iter().collect();
+                        let filtered_shows = search_results
+                            .map(|s| ui.search_filtered_items(&s.results.shows))
+                            .unwrap_or_default();
+                        let filtered_episodes = search_results
+                            .map(|s| ui.search_filtered_items(&s.results.episodes))
+                            .unwrap_or_default();
+
+                        let handled = match focus {
+                            SearchFocusState::Tracks => {
+                                window::handle_command_for_track_list_window(
+                                    command,
+                                    client_pub,
+                                    &filtered_tracks,
+                                    &data,
+                                    &mut ui,
+                                )?
+                            }
+                            SearchFocusState::Albums => {
+                                window::handle_command_for_album_list_window(
+                                    command,
+                                    &filtered_albums,
+                                    &data,
+                                    &mut ui,
+                                    client_pub,
+                                )?
+                            }
+                            SearchFocusState::Artists => {
+                                window::handle_command_for_artist_list_window(
+                                    command,
+                                    &filtered_artists,
+                                    &data,
+                                    &mut ui,
+                                )
+                            }
+                            SearchFocusState::Playlists => {
+                                window::handle_command_for_playlist_list_window(
+                                    command,
+                                    &filtered_playlists,
+                                    &data,
+                                    &mut ui,
+                                )
+                            }
+                            SearchFocusState::Shows => window::handle_command_for_show_list_window(
+                                command,
+                                &filtered_shows,
+                                &data,
+                                &mut ui,
+                            ),
+                            SearchFocusState::Episodes => {
+                                window::handle_command_for_episode_list_window(
+                                    command,
+                                    client_pub,
+                                    &filtered_episodes,
+                                    &data,
+                                    &mut ui,
+                                )?
+                            }
+                            SearchFocusState::Input => false,
+                        };
+
+                        if handled {
+                            ui.count_prefix = None;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            if let PageState::Library { .. } = ui.current_page() {
+                let layout = ui.library_layout;
+                if layout.valid {
+                    let within = |rect: ratatui::layout::Rect| -> bool {
+                        event.column >= rect.x
+                            && event.column < rect.x.saturating_add(rect.width)
+                            && event.row >= rect.y
+                            && event.row < rect.y.saturating_add(rect.height)
+                    };
+
+                    let target_focus = if within(layout.playlists) {
+                        Some(LibraryFocusState::Playlists)
+                    } else if within(layout.albums) {
+                        Some(LibraryFocusState::SavedAlbums)
+                    } else if within(layout.artists) {
+                        Some(LibraryFocusState::FollowedArtists)
+                    } else {
+                        None
+                    };
+
+                    if let Some(focus) = target_focus {
+                        let playlist_folder_id = match ui.current_page() {
+                            PageState::Library { state } => state.playlist_folder_id,
+                            _ => unreachable!(),
+                        };
+
+                        if let PageState::Library { state } = ui.current_page_mut() {
+                            state.focus = focus;
+                        }
+
+                        let data = state.data.read();
+                        let folder_items =
+                            data.user_data.folder_playlists_items(playlist_folder_id);
+                        let filtered_playlists = ui
+                            .search_filtered_items(&folder_items)
+                            .into_iter()
+                            .copied()
+                            .collect::<Vec<_>>();
+                        let filtered_playlists_refs =
+                            filtered_playlists.iter().copied().collect::<Vec<_>>();
+                        let filtered_albums =
+                            ui.search_filtered_items(&data.user_data.saved_albums);
+                        let filtered_artists =
+                            ui.search_filtered_items(&data.user_data.followed_artists);
+
+                        let handled = match focus {
+                            LibraryFocusState::Playlists => {
+                                window::handle_command_for_playlist_list_window(
+                                    command,
+                                    &filtered_playlists_refs,
+                                    &data,
+                                    &mut ui,
+                                )
+                            }
+                            LibraryFocusState::SavedAlbums => {
+                                window::handle_command_for_album_list_window(
+                                    command,
+                                    &filtered_albums,
+                                    &data,
+                                    &mut ui,
+                                    client_pub,
+                                )?
+                            }
+                            LibraryFocusState::FollowedArtists => {
+                                window::handle_command_for_artist_list_window(
+                                    command,
+                                    &filtered_artists,
+                                    &data,
+                                    &mut ui,
+                                )
+                            }
+                        };
+
+                        if handled {
+                            ui.count_prefix = None;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 // Handle a terminal key pressed event
@@ -99,6 +972,22 @@ fn handle_key_event(
 ) -> Result<()> {
     let key: Key = event.into();
     let mut ui = state.ui.lock();
+
+    if event.code == KeyCode::Esc && event.modifiers.is_empty() {
+        if ui.popup.is_some() {
+            ui.popup = None;
+            ui.input_key_sequence.keys.clear();
+            ui.count_prefix = None;
+            return Ok(());
+        }
+        if ui.history.len() > 1 {
+            ui.history.pop();
+            ui.popup = None;
+            ui.input_key_sequence.keys.clear();
+            ui.count_prefix = None;
+            return Ok(());
+        }
+    }
 
     let mut key_sequence = ui.input_key_sequence.clone();
     key_sequence.keys.push(key);
@@ -165,6 +1054,56 @@ fn handle_key_event(
             }
         }
     }
+
+    let pending_requests = std::mem::take(&mut ui.pending_client_requests);
+
+    drop(ui);
+
+    process_pending_client_requests(pending_requests, state, client_pub)?;
+
+    Ok(())
+}
+
+fn process_pending_client_requests(
+    requests: Vec<PendingClientRequest>,
+    state: &SharedState,
+    client_pub: &flume::Sender<ClientRequest>,
+) -> Result<()> {
+    for request in requests {
+        match request {
+            PendingClientRequest::SearchMore { query, category } => {
+                let maybe_offset = {
+                    let mut data = state.data.write();
+                    if let Some(mut entry) = data.caches.search.remove(&query) {
+                        let info = entry.pagination.info_mut(category);
+                        if info.is_fetching || info.is_exhausted {
+                            data.caches
+                                .search
+                                .insert(query.clone(), entry, *TTL_CACHE_DURATION);
+                            None
+                        } else {
+                            let offset = entry.results.len_for_category(category);
+                            info.is_fetching = true;
+                            data.caches
+                                .search
+                                .insert(query.clone(), entry, *TTL_CACHE_DURATION);
+                            Some(offset)
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(offset) = maybe_offset {
+                    client_pub.send(ClientRequest::SearchMore {
+                        query,
+                        category,
+                        offset,
+                    })?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -220,6 +1159,11 @@ pub fn handle_action_in_context(
             }
             Action::ToggleLiked => {
                 if data.user_data.is_liked_track(&track) {
+                    tracing::info!(
+                        "DeleteFromLibrary (toggle) for track '{}' ({})",
+                        track.name,
+                        track.id.uri()
+                    );
                     client_pub.send(ClientRequest::DeleteFromLibrary(ItemId::Track(track.id)))?;
                 } else {
                     client_pub.send(ClientRequest::AddToLibrary(Item::Track(track)))?;
@@ -233,6 +1177,11 @@ pub fn handle_action_in_context(
                 Ok(true)
             }
             Action::DeleteFromLiked => {
+                tracing::info!(
+                    "DeleteFromLibrary for track '{}' ({})",
+                    track.name,
+                    track.id.uri()
+                );
                 client_pub.send(ClientRequest::DeleteFromLibrary(ItemId::Track(track.id)))?;
                 ui.popup = None;
                 Ok(true)
@@ -306,6 +1255,19 @@ pub fn handle_action_in_context(
                 Ok(true)
             }
             Action::DeleteFromLibrary => {
+                if !data
+                    .user_data
+                    .saved_albums
+                    .iter()
+                    .any(|saved| saved.id == album.id)
+                {
+                    tracing::debug!(
+                        "Skip deleting album '{}' ({}) because it is not saved in library",
+                        album.name,
+                        album.id.uri()
+                    );
+                    return Ok(true);
+                }
                 client_pub.send(ClientRequest::DeleteFromLibrary(ItemId::Album(album.id)))?;
                 ui.popup = None;
                 Ok(true)
@@ -330,6 +1292,19 @@ pub fn handle_action_in_context(
                 Ok(true)
             }
             Action::Unfollow => {
+                if !data
+                    .user_data
+                    .followed_artists
+                    .iter()
+                    .any(|saved| saved.id == artist.id)
+                {
+                    tracing::debug!(
+                        "Skip unfollowing artist '{}' ({}) because it is not followed",
+                        artist.name,
+                        artist.id.uri()
+                    );
+                    return Ok(true);
+                }
                 client_pub.send(ClientRequest::DeleteFromLibrary(ItemId::Artist(artist.id)))?;
                 ui.popup = None;
                 Ok(true)
@@ -376,6 +1351,17 @@ pub fn handle_action_in_context(
                 Ok(true)
             }
             Action::DeleteFromLibrary => {
+                let is_saved = data.user_data.playlists.iter().any(
+                    |item| matches!(item, PlaylistFolderItem::Playlist(p) if p.id == playlist.id),
+                );
+                if !is_saved {
+                    tracing::debug!(
+                        "Skip deleting playlist '{}' ({}) because it is not saved in library",
+                        playlist.name,
+                        playlist.id.uri()
+                    );
+                    return Ok(true);
+                }
                 client_pub.send(ClientRequest::DeleteFromLibrary(ItemId::Playlist(
                     playlist.id,
                 )))?;
@@ -397,6 +1383,19 @@ pub fn handle_action_in_context(
                 Ok(true)
             }
             Action::DeleteFromLibrary => {
+                if !data
+                    .user_data
+                    .saved_shows
+                    .iter()
+                    .any(|saved| saved.id == show.id)
+                {
+                    tracing::debug!(
+                        "Skip deleting show '{}' ({}) because it is not saved in library",
+                        show.name,
+                        show.id.uri()
+                    );
+                    return Ok(true);
+                }
                 client_pub.send(ClientRequest::DeleteFromLibrary(ItemId::Show(show.id)))?;
                 ui.popup = None;
                 Ok(true)
@@ -699,6 +1698,41 @@ fn handle_global_command(
             ui.new_page(PageState::Library {
                 state: LibraryPageUIState::new(),
             });
+            let data = state.data.read();
+            let refresh_playlists = data
+                .user_data
+                .playlists_last_sync
+                .map(|t| t.elapsed() >= *LIBRARY_REFRESH_TTL)
+                .unwrap_or(true);
+            let refresh_saved_albums = data
+                .user_data
+                .saved_albums_last_sync
+                .map(|t| t.elapsed() >= *LIBRARY_REFRESH_TTL)
+                .unwrap_or(true);
+            let refresh_followed_artists = data
+                .user_data
+                .followed_artists_last_sync
+                .map(|t| t.elapsed() >= *LIBRARY_REFRESH_TTL)
+                .unwrap_or(true);
+            let refresh_saved_shows = data
+                .user_data
+                .saved_shows_last_sync
+                .map(|t| t.elapsed() >= *LIBRARY_REFRESH_TTL)
+                .unwrap_or(true);
+            drop(data);
+
+            if refresh_playlists {
+                client_pub.send(ClientRequest::GetUserPlaylists)?;
+            }
+            if refresh_saved_albums {
+                client_pub.send(ClientRequest::GetUserSavedAlbums)?;
+            }
+            if refresh_followed_artists {
+                client_pub.send(ClientRequest::GetUserFollowedArtists)?;
+            }
+            if refresh_saved_shows {
+                client_pub.send(ClientRequest::GetUserSavedShows)?;
+            }
         }
         Command::SearchPage => {
             ui.new_page(PageState::Search {
@@ -706,6 +1740,41 @@ fn handle_global_command(
                 current_query: String::new(),
                 state: SearchPageUIState::new(),
             });
+            let data = state.data.read();
+            let refresh_playlists = data
+                .user_data
+                .playlists_last_sync
+                .map(|t| t.elapsed() >= *LIBRARY_REFRESH_TTL)
+                .unwrap_or(true);
+            let refresh_saved_albums = data
+                .user_data
+                .saved_albums_last_sync
+                .map(|t| t.elapsed() >= *LIBRARY_REFRESH_TTL)
+                .unwrap_or(true);
+            let refresh_saved_shows = data
+                .user_data
+                .saved_shows_last_sync
+                .map(|t| t.elapsed() >= *LIBRARY_REFRESH_TTL)
+                .unwrap_or(true);
+            let refresh_followed_artists = data
+                .user_data
+                .followed_artists_last_sync
+                .map(|t| t.elapsed() >= *LIBRARY_REFRESH_TTL)
+                .unwrap_or(true);
+            drop(data);
+
+            if refresh_playlists {
+                client_pub.send(ClientRequest::GetUserPlaylists)?;
+            }
+            if refresh_saved_albums {
+                client_pub.send(ClientRequest::GetUserSavedAlbums)?;
+            }
+            if refresh_saved_shows {
+                client_pub.send(ClientRequest::GetUserSavedShows)?;
+            }
+            if refresh_followed_artists {
+                client_pub.send(ClientRequest::GetUserFollowedArtists)?;
+            }
         }
         Command::BrowsePage => {
             ui.new_page(PageState::Browse {

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
+
+BIN="target/release/spotify_player"
+
+if [[ ! -x "${BIN}" ]]; then
+  echo "Release binary not found, building..."
+  cargo build --release --features image
+fi
+
+exec "${BIN}" "$@"

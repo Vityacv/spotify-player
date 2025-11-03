@@ -5,8 +5,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::sync::LazyLock;
 
 use super::model::{
-    Album, Artist, Category, Context, ContextId, Id, Playlist, PlaylistFolderItem,
-    PlaylistFolderNode, SearchResults, Show, Track,
+    Album, Artist, CachedSearchResults, Category, Context, ContextId, Id, Playlist,
+    PlaylistFolderItem, PlaylistFolderNode, Show, Track,
 };
 use super::Lyrics;
 
@@ -26,6 +26,9 @@ pub enum FileCacheKey {
 pub static TTL_CACHE_DURATION: LazyLock<std::time::Duration> =
     LazyLock::new(|| std::time::Duration::from_secs(60 * 60));
 
+pub static LIBRARY_REFRESH_TTL: LazyLock<std::time::Duration> =
+    LazyLock::new(|| std::time::Duration::from_secs(30));
+
 /// the application's data
 pub struct AppData {
     pub user_data: UserData,
@@ -43,12 +46,16 @@ pub struct UserData {
     pub saved_shows: Vec<Show>,
     pub saved_albums: Vec<Album>,
     pub saved_tracks: HashMap<String, Track>,
+    pub playlists_last_sync: Option<std::time::Instant>,
+    pub followed_artists_last_sync: Option<std::time::Instant>,
+    pub saved_shows_last_sync: Option<std::time::Instant>,
+    pub saved_albums_last_sync: Option<std::time::Instant>,
 }
 
 /// the application's in-memory caches
 pub struct MemoryCaches {
     pub context: ttl_cache::TtlCache<String, Context>,
-    pub search: ttl_cache::TtlCache<String, SearchResults>,
+    pub search: ttl_cache::TtlCache<String, CachedSearchResults>,
     pub lyrics: ttl_cache::TtlCache<String, Option<Lyrics>>,
     pub genres: ttl_cache::TtlCache<String, Vec<String>>,
     #[cfg(feature = "image")]
@@ -139,6 +146,10 @@ impl UserData {
                 .unwrap_or_default(),
             saved_tracks: load_data_from_file_cache(FileCacheKey::SavedTracks, cache_folder)
                 .unwrap_or_default(),
+            playlists_last_sync: None,
+            followed_artists_last_sync: None,
+            saved_shows_last_sync: None,
+            saved_albums_last_sync: None,
         }
     }
 

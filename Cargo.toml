@@ -22,3 +22,12 @@ cast_precision_loss = { level = "allow", priority = 20 }
 missing_errors_doc = { level = "allow", priority = 20 }
 similar_names = { level = "allow", priority = 20 }
 too_many_lines = { level = "allow", priority = 20 }
+
+[patch.crates-io]
+librespot-core = { path = "../librespot/core" }
+librespot-connect = { path = "../librespot/connect" }
+librespot-playback = { path = "../librespot/playback" }
+librespot-metadata = { path = "../librespot/metadata" }
+librespot-audio = { path = "../librespot/audio" }
+librespot-oauth = { path = "../librespot/oauth" }
+librespot-protocol = { path = "../librespot/protocol" }

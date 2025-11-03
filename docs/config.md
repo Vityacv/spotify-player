@@ -289,7 +289,7 @@ lyrics_playing = { fg = "Green", modifiers = ["Bold"] }
 
 ## Keymaps
 
-`spotify_player` uses `keymap.toml` to add or override new key mappings in additional to [the default key mappings](../README.md#commands). To define a new key mapping, simply add a `keymaps` entry. To remove a key mapping, set its command to `None`. For example,
+`spotify_player` uses `keymap.toml` to add or override new key mappings in additional to [the default key mappings](../README.md#commands). For example, the defaults map `f1`, `f2`, and `f3` to the library, search, and browse pages respectively; you can change those bindings here. To define a new key mapping, simply add a `keymaps` entry. To remove a key mapping, set its command to `None`. For example,
 
 ```toml
 [[keymaps]]

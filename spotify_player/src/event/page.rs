@@ -198,12 +198,12 @@ fn handle_key_sequence_for_search_page(
     state: &SharedState,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
-    let (focus_state, current_query, line_input) = match ui.current_page_mut() {
+    let (focus_state, current_query_snapshot) = match ui.current_page() {
         PageState::Search {
             state,
-            line_input,
             current_query,
-        } => (state.focus, current_query, line_input),
+            ..
+        } => (state.focus, current_query.clone()),
         _ => anyhow::bail!("expect a search page"),
     };
 
@@ -212,16 +212,33 @@ fn handle_key_sequence_for_search_page(
         if key_sequence.keys.len() == 1 {
             return match &key_sequence.keys[0] {
                 Key::None(crossterm::event::KeyCode::Enter) => {
-                    if !line_input.is_empty() {
-                        *current_query = line_input.get_text();
-                        client_pub.send(ClientRequest::Search(line_input.get_text()))?;
+                    if let PageState::Search {
+                        line_input,
+                        current_query,
+                        ..
+                    } = ui.current_page_mut()
+                    {
+                        if !line_input.is_empty() {
+                            *current_query = line_input.get_text();
+                            client_pub.send(ClientRequest::Search {
+                                query: line_input.get_text(),
+                            })?;
+                        }
+                        Ok(true)
+                    } else {
+                        Ok(false)
                     }
-                    Ok(true)
                 }
-                k => match line_input.input(k) {
-                    None => Ok(false),
-                    _ => Ok(true),
-                },
+                k => {
+                    if let PageState::Search { line_input, .. } = ui.current_page_mut() {
+                        match line_input.input(k) {
+                            None => Ok(false),
+                            _ => Ok(true),
+                        }
+                    } else {
+                        Ok(false)
+                    }
+                }
             };
         }
     }
@@ -234,19 +251,32 @@ fn handle_key_sequence_for_search_page(
     };
 
     let data = state.data.read();
-    let search_results = data.caches.search.get(current_query);
+    let search_results = data.caches.search.get(&current_query_snapshot);
 
     match focus_state {
         SearchFocusState::Input => anyhow::bail!("user's search input should be handled before"),
         SearchFocusState::Tracks => {
             let tracks = search_results
-                .map(|s| s.tracks.iter().collect::<Vec<_>>())
+                .map(|s| s.results.tracks.iter().collect::<Vec<_>>())
                 .unwrap_or_default();
 
             match found_keymap {
-                CommandOrAction::Command(command) => window::handle_command_for_track_list_window(
-                    command, client_pub, &tracks, &data, ui,
-                ),
+                CommandOrAction::Command(command) => {
+                    let len = tracks.len();
+                    let handled = window::handle_command_for_track_list_window(
+                        command, client_pub, &tracks, &data, ui,
+                    )?;
+                    if handled && is_downward_command(&command) {
+                        maybe_queue_search_prefetch(
+                            ui,
+                            &data,
+                            current_query_snapshot.as_str(),
+                            SearchResultCategory::Tracks,
+                            len,
+                        );
+                    }
+                    Ok(handled)
+                }
                 CommandOrAction::Action(action, ActionTarget::SelectedItem) => {
                     window::handle_action_for_selected_item(action, &tracks, &data, ui, client_pub)
                 }
@@ -255,13 +285,25 @@ fn handle_key_sequence_for_search_page(
         }
         SearchFocusState::Artists => {
             let artists = search_results
-                .map(|s| s.artists.iter().collect::<Vec<_>>())
+                .map(|s| s.results.artists.iter().collect::<Vec<_>>())
                 .unwrap_or_default();
 
             match found_keymap {
-                CommandOrAction::Command(command) => Ok(
-                    window::handle_command_for_artist_list_window(command, &artists, &data, ui),
-                ),
+                CommandOrAction::Command(command) => {
+                    let len = artists.len();
+                    let handled =
+                        window::handle_command_for_artist_list_window(command, &artists, &data, ui);
+                    if handled && is_downward_command(&command) {
+                        maybe_queue_search_prefetch(
+                            ui,
+                            &data,
+                            current_query_snapshot.as_str(),
+                            SearchResultCategory::Artists,
+                            len,
+                        );
+                    }
+                    Ok(handled)
+                }
                 CommandOrAction::Action(action, ActionTarget::SelectedItem) => {
                     window::handle_action_for_selected_item(action, &artists, &data, ui, client_pub)
                 }
@@ -270,13 +312,26 @@ fn handle_key_sequence_for_search_page(
         }
         SearchFocusState::Albums => {
             let albums = search_results
-                .map(|s| s.albums.iter().collect::<Vec<_>>())
+                .map(|s| s.results.albums.iter().collect::<Vec<_>>())
                 .unwrap_or_default();
 
             match found_keymap {
-                CommandOrAction::Command(command) => window::handle_command_for_album_list_window(
-                    command, &albums, &data, ui, client_pub,
-                ),
+                CommandOrAction::Command(command) => {
+                    let len = albums.len();
+                    let handled = window::handle_command_for_album_list_window(
+                        command, &albums, &data, ui, client_pub,
+                    )?;
+                    if handled && is_downward_command(&command) {
+                        maybe_queue_search_prefetch(
+                            ui,
+                            &data,
+                            current_query_snapshot.as_str(),
+                            SearchResultCategory::Albums,
+                            len,
+                        );
+                    }
+                    Ok(handled)
+                }
                 CommandOrAction::Action(action, ActionTarget::SelectedItem) => {
                     window::handle_action_for_selected_item(action, &albums, &data, ui, client_pub)
                 }
@@ -286,7 +341,8 @@ fn handle_key_sequence_for_search_page(
         SearchFocusState::Playlists => {
             let playlists = search_results
                 .map(|s| {
-                    s.playlists
+                    s.results
+                        .playlists
                         .iter()
                         .map(|p| PlaylistFolderItem::Playlist(p.clone()))
                         .collect::<Vec<_>>()
@@ -296,12 +352,23 @@ fn handle_key_sequence_for_search_page(
 
             match found_keymap {
                 CommandOrAction::Command(command) => {
-                    Ok(window::handle_command_for_playlist_list_window(
+                    let len = playlist_refs.len();
+                    let handled = window::handle_command_for_playlist_list_window(
                         command,
                         &playlist_refs,
                         &data,
                         ui,
-                    ))
+                    );
+                    if handled && is_downward_command(&command) {
+                        maybe_queue_search_prefetch(
+                            ui,
+                            &data,
+                            current_query_snapshot.as_str(),
+                            SearchResultCategory::Playlists,
+                            len,
+                        );
+                    }
+                    Ok(handled)
                 }
                 CommandOrAction::Action(action, ActionTarget::SelectedItem) => {
                     window::handle_action_for_selected_item(
@@ -317,13 +384,25 @@ fn handle_key_sequence_for_search_page(
         }
         SearchFocusState::Shows => {
             let shows = search_results
-                .map(|s| s.shows.iter().collect::<Vec<_>>())
+                .map(|s| s.results.shows.iter().collect::<Vec<_>>())
                 .unwrap_or_default();
 
             match found_keymap {
-                CommandOrAction::Command(command) => Ok(
-                    window::handle_command_for_show_list_window(command, &shows, &data, ui),
-                ),
+                CommandOrAction::Command(command) => {
+                    let len = shows.len();
+                    let handled =
+                        window::handle_command_for_show_list_window(command, &shows, &data, ui);
+                    if handled && is_downward_command(&command) {
+                        maybe_queue_search_prefetch(
+                            ui,
+                            &data,
+                            current_query_snapshot.as_str(),
+                            SearchResultCategory::Shows,
+                            len,
+                        );
+                    }
+                    Ok(handled)
+                }
                 CommandOrAction::Action(action, ActionTarget::SelectedItem) => {
                     window::handle_action_for_selected_item(action, &shows, &data, ui, client_pub)
                 }
@@ -332,15 +411,26 @@ fn handle_key_sequence_for_search_page(
         }
         SearchFocusState::Episodes => {
             let episodes = match search_results {
-                Some(s) => s.episodes.iter().collect(),
+                Some(s) => s.results.episodes.iter().collect(),
                 None => Vec::new(),
             };
 
             match found_keymap {
                 CommandOrAction::Command(command) => {
-                    window::handle_command_for_episode_list_window(
+                    let len = episodes.len();
+                    let handled = window::handle_command_for_episode_list_window(
                         command, client_pub, &episodes, &data, ui,
-                    )
+                    )?;
+                    if handled && is_downward_command(&command) {
+                        maybe_queue_search_prefetch(
+                            ui,
+                            &data,
+                            current_query_snapshot.as_str(),
+                            SearchResultCategory::Episodes,
+                            len,
+                        );
+                    }
+                    Ok(handled)
                 }
                 CommandOrAction::Action(action, ActionTarget::SelectedItem) => {
                     window::handle_action_for_selected_item(

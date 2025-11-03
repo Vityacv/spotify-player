@@ -158,6 +158,29 @@ docker run --rm \
 -it aome510/spotify_player:latest
 ```
 
+### Local Playlist API (experimental)
+
+The repository includes a lightweight Python HTTP server at `local_api/server.py` that offers local-only playlist management, mirroring the basic Spotify playlist endpoints. It stores data in `local_api/data/playlists.json`.
+
+- Run it with `python local_api/server.py --host 127.0.0.1 --port 8765`.
+- `GET /health` returns a quick status check.
+- `GET /playlists` lists all local playlists.
+- `POST /playlists` creates a playlist (expects JSON with `name`, optional `description`, `public`, `collaborative`).
+- `POST /playlists/{playlist_id}/tracks` appends tracks (JSON `{ "tracks": [ ... ] }`).
+- `PUT /playlists/{playlist_id}` updates metadata.
+- `DELETE /playlists/{playlist_id}` removes a playlist; `DELETE /playlists/{playlist_id}/tracks/{track_id}` removes a track.
+
+Point the Rust client at this service to experiment with local storage instead of Spotify's backend.
+
+### Library Export/Import (experimental)
+
+Helper scripts let you snapshot your library (playlists, liked tracks/albums, followed artists, saved shows/episodes) using the same OAuth refresh token that spotify-player caches:
+
+- `python scripts/export_library.py --output ./library_exports` writes JSON files for playlists and saved content. Every run refreshes the cached token (`~/.cache/spotify-player/oauth_token.json`).
+- `python scripts/import_library.py --input ./library_exports --prefix "Restored - "` recreates playlists and re-saves tracks/albums/artists/shows to the current account. Add `--skip-playlists` if you only want the saved-content portion.
+
+If you only need playlists, the narrower scripts remain available: `export_playlists.py` and `import_playlists.py` operate on a directory of playlist JSON files.
+
 ## Features
 
 ### Spotify Connect
@@ -388,9 +411,9 @@ List of supported commands:
 | `RecentlyPlayedTrackPage`       | go to the user recently played track page                                                          | `g r`              |
 | `LikedTrackPage`                | go to the user liked track page                                                                    | `g y`              |
 | `LyricsPage`                    | go to the lyrics page of the current track                                                         | `g L`, `l`         |
-| `LibraryPage`                   | go to the user library page                                                                        | `g l`              |
-| `SearchPage`                    | go to the search page                                                                              | `g s`              |
-| `BrowsePage`                    | go to the browse page                                                                              | `g b`              |
+| `LibraryPage`                   | go to the user library page                                                                        | `g l` / `f1`       |
+| `SearchPage`                    | go to the search page                                                                              | `g s` / `f2`       |
+| `BrowsePage`                    | go to the browse page                                                                              | `g b` / `f3`       |
 | `Queue`                         | go to the queue page                                                                               | `z`                |
 | `OpenCommandHelp`               | go to the command help page                                                                        | `?`, `C-h`         |
 | `PreviousPage`                  | go to the previous page                                                                            | `backspace`, `C-q` |

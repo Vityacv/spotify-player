@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Move to repository root (script lives in scripts/).
+REPO_ROOT="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
+
+git pull --ff-only
+
+if [[ -n "${RUSTFLAGS:-}" ]]; then
+  export RUSTFLAGS="${RUSTFLAGS} -C debuginfo=0"
+else
+  export RUSTFLAGS="-C debuginfo=0"
+fi
+
+cargo build --release --features image
