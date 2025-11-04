@@ -8,6 +8,9 @@
 > - Keyboard shortcuts: `F1` library, `F2` search, `F3` browse.
 > - OAuth helper scripts & local tools for token acquisition / library export (see `scripts/` and `OAUTH.md`).
 > - Browse categories show Spotify rate-limit countdowns, automatically retry when windows expire, and gracefully skip/inspect unusual playlist payloads returned by the API (logs include truncated JSON).
+> - CI-ready dependency layout: defaults to upstream `librespot` crates; local builds can override with a `.cargo/config.toml` `[patch]` pointing at `../librespot/*`.
+> - Tag pushes (`v*`) trigger the release workflow, building binaries for Linux/macOS/Windows and attaching them to GitHub Releases automatically.
+> - Run `scripts/tag_release.sh` to create a UTC timestamped tag and push it (kicks off the release workflow).
 
 ## Table of Contents
 
